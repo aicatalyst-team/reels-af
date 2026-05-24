@@ -59,13 +59,19 @@ def _ffmpeg_escape(s: str) -> str:
     # drawtext's broken handling of single quotes inside text='...'
     # (we'd otherwise need shell-style break-quote-rejoin sequences).
     s = s.replace("'", "’")
-    # Replace ASCII straight quote with typographic “” for the same reason.
+    # Same for straight double-quote.
     s = s.replace('"', "”")
+    # The ASCII percent sign is the start of drawtext's `%{...}` placeholder
+    # syntax. Even with backslash escape (`\%`) drawtext silently drops the
+    # ENTIRE text — so a caption "30%" renders as a blank frame. Helvetica
+    # (our default font) also lacks the fullwidth `％`, so we can't swap
+    # glyphs. Substitute the spelled-out " PCT" — readable, unambiguous,
+    # and unaffected by drawtext's placeholder parser.
+    s = s.replace("%", " PCT")
     return (
         s.replace("\\", "\\\\")
          .replace(":", r"\:")
          .replace(",", r"\,")
-         .replace("%", r"\%")
     )
 
 
@@ -92,12 +98,14 @@ async def _render_segment(
     is_first: bool = False,
 ) -> None:
     audio_dur = _probe_duration(audio_path)
-    # Target clip duration = the spoken duration + a small tail. The final
-    # scene gets a longer hold so the close doesn't cut abruptly.
+    # Target clip duration = spoken duration + small tail. The final scene
+    # gets a longer hold so the close doesn't cut abruptly.
     tail = FINAL_HOLD_S if is_final else 0.15
-    # The first scene also gets a START PAD — frozen first frame + silence —
-    # so the viewer registers the hook visual before the voice hits.
-    head = START_PAD_S if is_first else 0.0
+    # NO head-pad on first scene. Previously we froze the first frame for
+    # 0.4s with tpad — but tpad's PTS rewrite broke drawtext's alpha
+    # animation, so clip 0 rendered captionless. Voice + visual + caption
+    # all start together; the viewer registers them simultaneously.
+    head = 0.0
     clip_dur = head + audio_dur + tail
 
     # Caption: measured-width fit. Picks the largest single-line fontsize

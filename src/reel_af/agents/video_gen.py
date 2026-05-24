@@ -46,28 +46,48 @@ VIDEO_MODEL = os.getenv(
 # a tail; ffmpeg will trim to the actual audio length at assembly.
 _VEO_DURATIONS = (4, 6, 8)
 
-# Global style block appended to every image prompt so all shots feel like
-# the same reel. Editable in one place.
-STYLE_NOTE = (
+# Style notes appended to every image+motion prompt. Picked by content_mode
+# so scientific reels don't end up looking like a perfume ad.
+GENERAL_STYLE_NOTE = (
     "cinematic documentary still, warm natural light, shallow depth of field, "
     "35mm film grain, VERTICAL portrait composition (taller than wide, the "
     "subject occupies the upper-middle two-thirds), fills the frame, no text "
     "or letters"
 )
 
+SCIENTIFIC_STYLE_NOTE = (
+    "documentary photograph from a working research lab, sharp focus throughout, "
+    "neutral white-balanced lighting (overhead fluorescent or a single bright "
+    "desk lamp, no warm filters), realistic colors, no shallow depth-of-field "
+    "blur, no film grain, no lens flares; VERTICAL portrait composition with "
+    "the artifact (plot / paper / interface / instrument) occupying the upper "
+    "two-thirds; the frame should look like a phone snapshot of an actual "
+    "research workspace, not a movie still; no text or letters in frame"
+)
 
-def _veo_duration(est_s: float) -> int:
-    """Pick the smallest accepted Veo duration ≥ est_s, capped at 8s."""
+
+def _style_note(content_mode: str) -> str:
+    return SCIENTIFIC_STYLE_NOTE if content_mode == "scientific" else GENERAL_STYLE_NOTE
+
+
+def _veo_duration_for_audio(target_s: float) -> int:
+    """Pick the smallest Veo duration that CLEARLY covers target_s.
+
+    We add a 1.0s safety margin then round UP to {4, 6, 8}. Result: trim
+    in the stitch step always has frames left to cut, never holds the
+    last frame as a visible freeze.
+    """
+    needed = target_s + 1.0
     for d in _VEO_DURATIONS:
-        if d >= est_s:
+        if d >= needed:
             return d
     return _VEO_DURATIONS[-1]
 
 
-def _augment(prompt: str) -> str:
-    """Append the global style block to an image prompt."""
+def _augment(prompt: str, content_mode: str = "general") -> str:
+    """Append the style block (mode-aware) to an image prompt."""
     base = prompt.strip().rstrip(".")
-    return f"{base}. {STYLE_NOTE}."
+    return f"{base}. {_style_note(content_mode)}."
 
 
 def _image_to_data_url(path: Path) -> str:
@@ -122,6 +142,7 @@ async def _gen_first_frame(
     idx: int,
     out_dir: Path,
     max_retries: int = 4,
+    content_mode: str = "general",
 ) -> Path:
     """Generate a vertical 9:16 first frame from the shot plan's image prompt.
 
@@ -135,7 +156,7 @@ async def _gen_first_frame(
     request (no provider exposes the param today). We compose for vertical
     via the prompt and post-process to 9:16 ourselves.
     """
-    prompt = _augment(plan.image_prompt)
+    prompt = _augment(plan.image_prompt, content_mode=content_mode)
     last_err: Exception | None = None
     for attempt in range(max_retries):
         try:
@@ -173,15 +194,27 @@ async def _gen_video(
     seg: Scene,
     first_frame: Path,
     out_dir: Path,
+    target_duration_s: float | None = None,
+    content_mode: str = "general",
 ) -> Path:
-    """Veo image-to-video. Uses the grok-imagine still as the starting frame."""
+    """Veo image-to-video. Uses the first frame as the starting still.
+
+    target_duration_s — actual spoken duration of this scene. We round
+    UP to the next Veo bucket with a safety margin so the assembly trim
+    has frames to spare, instead of the trim sitting past the last
+    rendered frame (which is what makes the video "pause" while audio
+    finishes). Falls back to scene.est_duration_s if not supplied.
+    """
     frame_url = _image_to_data_url(first_frame)
-    duration = _veo_duration(seg.est_duration_s)
+    duration = _veo_duration_for_audio(
+        target_duration_s if target_duration_s is not None else seg.est_duration_s
+    )
+    style = _style_note(content_mode)
     # Compose Veo prompt: the literal scene is set by first_frame; the motion
-    # prompt is what should HAPPEN. We also pass the on-screen-text context
-    # so Veo doesn't try to ALSO put text in the video (it sometimes does).
+    # prompt is what should HAPPEN. We also tell Veo not to add on-screen
+    # text (it sometimes does).
     veo_prompt = (
-        f"{plan.motion_prompt}. {STYLE_NOTE}. "
+        f"{plan.motion_prompt}. {style}. "
         f"Do not add any text, captions, or letters to the frame."
     )
 
@@ -266,8 +299,14 @@ async def gen_shot(
     seg: Scene,
     plan: ShotPlanV2,
     out_dir: Path,
+    target_duration_s: float | None = None,
+    content_mode: str = "general",
 ) -> BeatArtifact:
     """Generate first-frame + video for one segment, with two fallbacks.
+
+    target_duration_s — actual spoken duration of the scene's audio
+    segment. Drives both the Veo clip length and the still-fallback's
+    ken-burns duration so timing matches the voice exactly.
 
     Failure modes handled in priority order:
       1. Image gen fails after retries  → placeholder still + ken-burns.
@@ -275,25 +314,31 @@ async def gen_shot(
                                         → still + ken-burns on the real frame.
     Either way the segment produces SOMETHING so the reel still assembles.
     """
+    fb_dur = (target_duration_s + 0.5) if target_duration_s else 4.0
     try:
-        frame = await _gen_first_frame(provider, plan, seg.idx, out_dir)
+        frame = await _gen_first_frame(
+            provider, plan, seg.idx, out_dir, content_mode=content_mode,
+        )
     except Exception as e:
         print(
             f"[video_gen] scene {seg.idx} image gen failed after retries ({e}); "
             f"using placeholder frame."
         )
         frame = _placeholder_frame(seg.idx, out_dir)
-        # Skip Veo entirely — i2v on a placeholder is a waste.
         fallback = out_dir / f"seg-{seg.idx:02d}-fallback.mp4"
-        video = await _still_as_video(frame, duration=4.0, out_path=fallback)
+        video = await _still_as_video(frame, duration=fb_dur, out_path=fallback)
         return BeatArtifact(idx=seg.idx, image_path=video)
 
     try:
-        video = await _gen_video(provider, plan, seg, frame, out_dir)
+        video = await _gen_video(
+            provider, plan, seg, frame, out_dir,
+            target_duration_s=target_duration_s,
+            content_mode=content_mode,
+        )
     except Exception as e:
         print(f"[video_gen] scene {seg.idx} Veo failed ({e}); falling back to still.")
         fallback = out_dir / f"seg-{seg.idx:02d}-fallback.mp4"
-        video = await _still_as_video(frame, duration=4.0, out_path=fallback)
+        video = await _still_as_video(frame, duration=fb_dur, out_path=fallback)
     return BeatArtifact(idx=seg.idx, image_path=video)
 
 
@@ -301,14 +346,29 @@ async def generate_videos(
     segments: list[Scene],
     plans: list[ShotPlanV2],
     out_dir: Path,
+    audio_durations: dict[int, float] | None = None,
+    content_mode: str = "general",
 ) -> list[BeatArtifact]:
-    """Fan-out video generation across all segments."""
+    """Fan-out video generation across all segments.
+
+    audio_durations: {scene_idx: seconds} — real per-segment audio
+    durations, used to size every Veo clip and still-fallback so video
+    timing tracks voice exactly (no last-frame freezes).
+    """
     if len(segments) != len(plans):
         raise ValueError("video_gen: segments and plans length mismatch")
     out_dir.mkdir(parents=True, exist_ok=True)
+    audio_durations = audio_durations or {}
     provider = OpenRouterProvider()
     results = await asyncio.gather(
-        *(gen_shot(provider, s, p, out_dir) for s, p in zip(segments, plans)),
+        *(
+            gen_shot(
+                provider, s, p, out_dir,
+                target_duration_s=audio_durations.get(s.idx),
+                content_mode=content_mode,
+            )
+            for s, p in zip(segments, plans)
+        ),
         return_exceptions=True,
     )
     errs = [r for r in results if isinstance(r, Exception)]

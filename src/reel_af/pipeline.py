@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from reel_af.agents.captioner import rewrite_captions
 from reel_af.agents.distiller import distill
 from reel_af.agents.navigator import navigate
 from reel_af.agents.scene_breaker import break_scenes
@@ -77,6 +78,11 @@ async def run_pipeline(app: Any, url: str, out_dir: Path, run_id: str) -> dict:
     scenes = await break_scenes(app, draft.script)
     timings["scenes"] = time.time() - t
 
+    # 4b. Rewrite captions contrapuntally with article context.
+    t = time.time()
+    scenes = await rewrite_captions(app, scenes, summary, draft.script)
+    timings["captions"] = round(time.time() - t, 2)
+
     # Vocabulary almost always done by now.
     vocab = await vocab_task
     timings["vocab_wait"] = round(time.time() - t, 2)
@@ -89,6 +95,9 @@ async def run_pipeline(app: Any, url: str, out_dir: Path, run_id: str) -> dict:
             tone=draft.voice_tone, full_script=draft.script, vocab=vocab,
             topic_familiarity=summary.topic_familiarity,
             content_mode=summary.content_mode,
+            article_thesis=summary.one_line_thesis,
+            article_takeaway=summary.intended_takeaway,
+            article_examples=summary.concrete_examples,
         )
     )
     tts_task = asyncio.create_task(
@@ -103,15 +112,32 @@ async def run_pipeline(app: Any, url: str, out_dir: Path, run_id: str) -> dict:
     plans = await plans_task
     timings["director"] = time.time() - t
 
-    # 6. Veo i2v per scene (parallel). Audio still streaming.
-    t = time.time()
-    video_artifacts = await generate_videos(scenes, plans, media_dir)
-    timings["video"] = time.time() - t
-
-    # Audio almost certainly done by now.
+    # Pull audio FIRST so video clips can be sized to actual spoken durations
+    # (estimates under-shoot, causing last-frame freezes during voiceover).
+    # Audio is short (~5-15s) and was already started; audio_wait is usually ~0.
     t = time.time()
     audio_artifacts, full_audio = await tts_task
     timings["audio_wait"] = round(time.time() - t, 2)
+
+    import subprocess
+    def _probe(path: Path) -> float:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, check=True,
+        )
+        return float(out.stdout.strip())
+    audio_durations = {a.idx: _probe(a.audio_path) for a in audio_artifacts}
+
+    # 6. Veo i2v per scene (parallel), sized to actual audio durations and
+    # content-mode-aware visual style.
+    t = time.time()
+    video_artifacts = await generate_videos(
+        scenes, plans, media_dir,
+        audio_durations=audio_durations,
+        content_mode=summary.content_mode,
+    )
+    timings["video"] = time.time() - t
 
     # 8. Stitch (per-segment ffmpeg renders parallel + concat)
     t = time.time()

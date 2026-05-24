@@ -125,10 +125,11 @@ async def compose_script(summary: dict) -> dict:
 
 @reel.reasoner()
 async def break_scenes_step(script: str) -> dict:
-    """Sub-reasoner: split the script into scenes + per-scene captions.
+    """Sub-reasoner: split the script into scenes + first-pass captions.
 
-    Composable so the planner can call it via app.call() — control plane
-    sees this as its own DAG node, enabling per-step retry/replay.
+    First-pass captions are paraphrases (just to have something) — the
+    captioner reasoner rewrites them contrapuntally with the article
+    summary in context.
     """
     from reel_af.agents.scene_breaker import break_scenes
     scenes = await break_scenes(app, script)
@@ -137,6 +138,33 @@ async def break_scenes_step(script: str) -> dict:
             {"idx": s.idx, "sentence": s.sentence, "caption": s.caption,
              "est_duration_s": s.est_duration_s, "role": s.role}
             for s in scenes
+        ]
+    }
+
+
+@reel.reasoner()
+async def rewrite_captions_step(
+    scenes: list[dict], summary: dict, full_script: str,
+) -> dict:
+    """Sub-reasoner: rewrite per-scene captions to be CONTRAPUNTAL.
+
+    Replaces the paraphrase captions from break_scenes_step with ones
+    that add information the voice doesn't say — the specific number,
+    the named result, the jargon translation, the punchline early.
+    """
+    from reel_af.agents.captioner import rewrite_captions
+    from reel_af.agents.distiller import ArticleSummary
+    from reel_af.agents.scene_breaker import Scene
+    article_summary = ArticleSummary(**summary)
+    scene_objs = [Scene(**s) for s in scenes]
+    rewritten = await rewrite_captions(
+        app, scene_objs, article_summary, full_script,
+    )
+    return {
+        "scenes": [
+            {"idx": s.idx, "sentence": s.sentence, "caption": s.caption,
+             "est_duration_s": s.est_duration_s, "role": s.role}
+            for s in rewritten
         ]
     }
 
@@ -219,12 +247,17 @@ async def generate_shot_plans(
     tone: str, full_script: str,
     topic_familiarity: str = "hot",
     content_mode: str = "general",
+    article_thesis: str = "",
+    article_takeaway: str = "",
+    article_examples: list[str] | None = None,
 ) -> dict:
     """Phase 4a — per-scene shot plans (image prompt + motion prompt).
 
     Runs in parallel with synthesize_audio (no dependency between them).
     `topic_familiarity` and `content_mode` switch the shot director into
     the right register (obscure-accessibility or scientific-technical).
+    `article_*` give the director paper-level grounding so the visuals
+    stay anchored to THIS paper, not a generic "AI research" mood.
     """
     from reel_af.agents.scene_breaker import Scene
     from reel_af.agents.shot_director_v2 import _direct_one
@@ -255,6 +288,9 @@ async def generate_shot_plans(
             motif_description=motif.description,
             topic_familiarity=topic_familiarity,
             content_mode=content_mode,
+            article_thesis=article_thesis,
+            article_takeaway=article_takeaway,
+            article_examples=article_examples,
         )
         return result.model_dump()
 
@@ -283,11 +319,27 @@ async def synthesize_audio(
         out_dir=Path(out_dir),
         tone=voice_tone,
     )
+    # Measure each per-scene audio so video gen can size Veo clips to the
+    # ACTUAL spoken duration (word-count estimates under-shoot, which makes
+    # the video freeze on the last frame while the audio finishes).
+    import subprocess
+    def _probe(path: Path) -> float:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, check=True,
+        )
+        return float(out.stdout.strip())
     return {
         "voice": voice,
         "full_audio_path": str(full_audio),
         "segments": [
-            {"idx": a.idx, "audio_path": str(a.audio_path)} for a in artifacts
+            {
+                "idx": a.idx,
+                "audio_path": str(a.audio_path),
+                "duration_s": _probe(a.audio_path),
+            }
+            for a in artifacts
         ],
     }
 
@@ -295,25 +347,42 @@ async def synthesize_audio(
 @reel.reasoner()
 async def gen_first_frame_step(
     scene_idx: int, plan: dict, out_dir: str,
+    content_mode: str = "general",
 ) -> dict:
-    """Sub-reasoner: grok-imagine generates a vertical first frame from
-    the shot plan's image_prompt. One call per scene → many in parallel."""
+    """Sub-reasoner: image-gen produces a vertical first frame.
+
+    content_mode picks the style note layered onto the prompt
+    (cinematic-doc for general, clinical-lab for scientific).
+    """
     from agentfield.media_providers import OpenRouterProvider
     from reel_af.agents.shot_director_v2 import ShotPlanV2
     from reel_af.agents.video_gen import _gen_first_frame
 
     provider = OpenRouterProvider()
     plan_obj = ShotPlanV2(**plan)
-    frame_path = await _gen_first_frame(provider, plan_obj, scene_idx, Path(out_dir))
+    frame_path = await _gen_first_frame(
+        provider, plan_obj, scene_idx, Path(out_dir),
+        content_mode=content_mode,
+    )
     return {"scene_idx": scene_idx, "frame_path": str(frame_path)}
 
 
 @reel.reasoner()
 async def gen_video_from_frame_step(
     scene_idx: int, plan: dict, scene: dict, frame_path: str, out_dir: str,
+    target_duration_s: float | None = None,
+    content_mode: str = "general",
 ) -> dict:
-    """Sub-reasoner: Veo image-to-video using a grok-imagine first frame.
-    Falls back to ken-burns-on-still if Veo content-moderates the frame."""
+    """Sub-reasoner: Veo image-to-video using the prior step's first frame.
+
+    target_duration_s — REAL spoken duration of this scene's audio. We
+    size the Veo clip with enough headroom to cover that (so the trim in
+    assembly cuts off the spare, instead of holding the last frame as a
+    visible freeze). Falls back to scene.est_duration_s if not provided.
+
+    On Veo failure (most often: content-moderation false positive) we
+    render a still + ken-burns fallback so the reel still assembles.
+    """
     from agentfield.media_providers import OpenRouterProvider
     from reel_af.agents.scene_breaker import Scene
     from reel_af.agents.shot_director_v2 import ShotPlanV2
@@ -322,20 +391,33 @@ async def gen_video_from_frame_step(
     provider = OpenRouterProvider()
     plan_obj = ShotPlanV2(**plan)
     scene_obj = Scene(**scene)
+    used_fallback = False
     try:
         video_path = await _gen_video(
             provider, plan_obj, scene_obj, Path(frame_path), Path(out_dir),
+            target_duration_s=target_duration_s,
+            content_mode=content_mode,
         )
     except Exception as e:
-        # Veo content-moderation false-positive → fall back to still+ken-burns
+        print(f"[app.gen_video_from_frame_step] scene {scene_idx} Veo failed ({e}); still fallback.")
         fallback = Path(out_dir) / f"seg-{scene_idx:02d}-fallback.mp4"
-        video_path = await _still_as_video(Path(frame_path), 4.0, fallback)
-    return {"scene_idx": scene_idx, "video_path": str(video_path), "used_fallback": False}
+        # Match the still's duration to the actual spoken duration so the
+        # ken-burns doesn't freeze either.
+        dur = target_duration_s if target_duration_s else 4.0
+        video_path = await _still_as_video(Path(frame_path), dur + 0.5, fallback)
+        used_fallback = True
+    return {
+        "scene_idx": scene_idx,
+        "video_path": str(video_path),
+        "used_fallback": used_fallback,
+    }
 
 
 @reel.reasoner()
 async def generate_videos_phase(
     scenes: list[dict], plans: list[dict], out_dir: str,
+    audio_durations: dict[str, float] | None = None,
+    content_mode: str = "general",
 ) -> dict:
     """Phase 5 — orchestrates per-scene (first_frame → veo) via app.call().
 
@@ -343,20 +425,30 @@ async def generate_videos_phase(
     parallel via asyncio.gather. The control plane records every node:
     `generate_videos_phase` → per-scene `gen_first_frame_step` then
     `gen_video_from_frame_step`. Depth-3 DAG inside this phase.
+
+    audio_durations: {str(scene_idx): seconds} from the audio phase, so
+    video clips are sized to the ACTUAL spoken length (not the
+    word-count estimate that under-shoots and causes freezes).
     """
     node = app.node_id
+    audio_durations = audio_durations or {}
 
     async def _one_scene(scene_dict: dict, plan_dict: dict) -> dict:
+        idx = scene_dict["idx"]
+        target_dur = audio_durations.get(str(idx))
         frame_resp = await app.call(
             f"{node}.reel_gen_first_frame_step",
-            scene_idx=scene_dict["idx"], plan=plan_dict, out_dir=out_dir,
+            scene_idx=idx, plan=plan_dict, out_dir=out_dir,
+            content_mode=content_mode,
         )
         video_resp = await app.call(
             f"{node}.reel_gen_video_from_frame_step",
-            scene_idx=scene_dict["idx"], plan=plan_dict, scene=scene_dict,
+            scene_idx=idx, plan=plan_dict, scene=scene_dict,
             frame_path=frame_resp["frame_path"], out_dir=out_dir,
+            target_duration_s=target_dur,
+            content_mode=content_mode,
         )
-        return {"idx": scene_dict["idx"], "video_path": video_resp["video_path"]}
+        return {"idx": idx, "video_path": video_resp["video_path"]}
 
     videos = await asyncio.gather(
         *(_one_scene(s, p) for s, p in zip(scenes, plans))
@@ -496,6 +588,14 @@ async def generate(url: str, out_dir: str | None = None) -> dict:
     scenes = scenes_resp["scenes"]
     timings["break_scenes"] = round(time.time() - t, 1)
 
+    # 3b. Rewrite captions contrapuntally (uses summary + full script).
+    # Quick LLM call (~5s); fully in parallel with the upcoming audio + arc.
+    t = time.time()
+    captioner_task = asyncio.create_task(app.call(
+        f"{node}.reel_rewrite_captions_step",
+        scenes=scenes, summary=summary, full_script=draft["script"],
+    ))
+
     # Wait for vocab (almost always already done).
     vocab_resp = await vocab_task
 
@@ -518,8 +618,16 @@ async def generate(url: str, out_dir: str | None = None) -> dict:
     arc_resp = await arc_task
     timings["plan_visual_arc"] = round(time.time() - t, 1)
 
+    # Captioner is cheap and was running in parallel since break_scenes.
+    # Replace scenes with contrapuntal-caption versions before any agent
+    # downstream of here uses them (shot director gets the better caption,
+    # assembly burns the better caption).
+    captioned_resp = await captioner_task
+    scenes = captioned_resp["scenes"]
+
     # 5. generate_shot_plans — needs arc + vocab. Audio still streaming in
-    # background.
+    # background. Pass article-level context so the director's image
+    # prompts stay grounded in THIS paper, not generic field aesthetics.
     t = time.time()
     shot_plans_resp = await app.call(
         f"{node}.reel_generate_shot_plans",
@@ -527,24 +635,36 @@ async def generate(url: str, out_dir: str | None = None) -> dict:
         vocabulary=vocab_resp["vocabulary"],
         tone=draft["voice_tone"], full_script=draft["script"],
         topic_familiarity=topic_familiarity, content_mode=content_mode,
+        article_thesis=summary.get("one_line_thesis", ""),
+        article_takeaway=summary.get("intended_takeaway", ""),
+        article_examples=summary.get("concrete_examples", []),
     )
     timings["generate_shot_plans"] = round(time.time() - t, 1)
     plans = shot_plans_resp["plans"]
 
-    # 6. Video generation (Veo i2v per scene, parallel internally).
-    # Audio task continues running in the background.
+    # Collect audio BEFORE kicking off video gen so we know each scene's
+    # ACTUAL spoken duration. Sizing Veo clips to estimated duration was
+    # under-shooting and the stitch step held the last frame on the freeze
+    # ("video pauses while voice runs"). Audio is short (~5-15s) compared
+    # to the arc+shot_plans we already overlapped — audio_wait is normally 0.
+    t = time.time()
+    audio_resp = await audio_task
+    timings["audio_wait"] = round(time.time() - t, 1)
+    audio_durations = {
+        str(seg["idx"]): seg["duration_s"]
+        for seg in audio_resp["segments"]
+    }
+
+    # 6. Video generation (Veo i2v per scene, parallel internally). Sized
+    # to actual audio durations + content_mode-aware style.
     t = time.time()
     videos_resp = await app.call(
         f"{node}.reel_generate_videos_phase",
         scenes=scenes, plans=plans, out_dir=str(media_dir),
+        audio_durations=audio_durations,
+        content_mode=content_mode,
     )
     timings["videos"] = round(time.time() - t, 1)
-
-    # Now collect audio (almost certainly already done — it had ~5 minutes
-    # of cover while we ran arc + shots + videos).
-    t = time.time()
-    audio_resp = await audio_task
-    timings["audio_wait"] = round(time.time() - t, 1)
 
     # 7. Assemble final reel.
     t = time.time()

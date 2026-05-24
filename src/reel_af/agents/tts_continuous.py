@@ -90,16 +90,43 @@ def _wrap_as_narration(script: str, tone: str) -> str:
 
     The SDK's generate_audio() only takes a single user message, so we
     can't pass a system role to coerce the model into 'read verbatim'
-    mode. We embed the directive inline. The DIVIDER block makes it
-    visually obvious to the model where the literal script begins.
+    mode. We embed the directive inline.
+
+    The DELIVERY PRINCIPLES below are distilled from the rhythm of
+    high-retention science explainer reels — earnest curiosity, not
+    "creator hype". The divider block makes it visually obvious to the
+    model where the literal script begins.
     """
     return (
-        f"You are a professional vertical-video narrator. Read EVERY word "
+        f"You are a vertical-video science narrator. Read EVERY word "
         f"between the dividers below EXACTLY as written, with a {tone} "
         f"tone. Do not greet, comment, summarise, or add ANY words of "
-        f"your own. Vary pace deliberately. Em-dashes are a deliberate "
-        f"pause. Single-word periods are punchy beats. ALL CAPS WORDS "
-        f"are emphasised. The last sentence lands slow and weighty.\n\n"
+        f"your own.\n\n"
+        f"DELIVERY PRINCIPLES — these are HOW the script should sound, "
+        f"not what to say:\n"
+        f"  • Sound like you're discovering this alongside the viewer, "
+        f"not lecturing them. Earnest curiosity, not creator hype.\n"
+        f"  • Treat the listener as a smart friend who hasn't read the "
+        f"paper. Conversational, not corporate.\n"
+        f"  • When a NUMBER, percentage, or NAMED METHOD lands "
+        f"(e.g. \"84%\", \"AlphaGeometry\", \"surface code\"), give it "
+        f"a half-beat of breath before AND after. Let it register.\n"
+        f"  • Pitch slightly UP on the surprising or counter-intuitive "
+        f"clause — the place where 'wait, really?' would happen in the "
+        f"listener's head. Match their reaction.\n"
+        f"  • Em-dashes (—) are a deliberate THINK pause. Single-word "
+        f"periods (\"Wrong.\" \"Solved.\") are emphatic beats — short, "
+        f"impactful, then breathe.\n"
+        f"  • The FIRST sentence is the scroll-stopper. Open with "
+        f"energy and CLARITY — don't waste the hook on a low-volume "
+        f"warm-up syllable.\n"
+        f"  • The LAST sentence is the close. Slow down. Drop volume "
+        f"slightly. Let it land like a period instead of trailing off.\n"
+        f"  • ALL CAPS WORDS get a small lean-in — fractionally louder "
+        f"and slower, not shouted.\n"
+        f"  • Casual transitions (\"and here's the wild thing\", \"turns "
+        f"out\") are spoken in the same warm register as the surrounding "
+        f"narration — no sudden creator-voice gear-shift.\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{script}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

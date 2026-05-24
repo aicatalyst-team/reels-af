@@ -144,7 +144,9 @@ CREATIVE RULES (this is where reels die or pop):
 (3) MOTION REVEALS, NEVER RESTATES.
     The motion prompt must add information the still didn't show. Bad: "slow
     camera push on the man." Good: "the man's hand opens to reveal a folded
-    paper he's been holding." The motion must do narrative work.
+    paper he's been holding." The motion must do narrative work AND, when
+    possible, DEMONSTRATE the article's actual claim (the curve rising, the
+    numbers ticking, the molecule folding, the gate firing).
 
 (4) REAL SUBJECTS, REAL ENVIRONMENTS.
     Documentary / cinematic feel. No abstract concept art ("glowing brain",
@@ -157,6 +159,19 @@ CREATIVE RULES (this is where reels die or pop):
     moment of the motion. "Hand holding paper" image + "paper unfolds and a
     drawing is revealed" motion — that's a designed shot.
 
+(6) IMAGE PROMPT MUST BE COMPOSITION-SPECIFIC. Cover EVERY one of these:
+      - SUBJECT: what physical thing/person fills the frame? (specific noun)
+      - FRAMING: extreme close-up / mid / wide; the subject occupies what
+        fraction of the frame and where (centered / off-center / lower-third)?
+      - LIGHTING: source direction + quality (single overhead fluorescent /
+        warm desk lamp at 45° / cold north window / phone screen glow)
+      - COLOR PALETTE: 2-3 dominant colors, by name
+      - DEPTH: what is in sharp focus vs deliberately soft; foreground vs
+        background relationship
+      - ONE UNEXPECTED ELEMENT: name it explicitly
+    Aim for 50-100 words. A reader should be able to sketch the frame from
+    your prompt alone.
+
 REEL TONE: {tone}.
 {mode_block}
 FULL SCRIPT (cohesion only — pick visuals distinct from other beats):
@@ -165,8 +180,9 @@ FULL SCRIPT (cohesion only — pick visuals distinct from other beats):
 Return:
   anchor_type = {anchor}    (echo verbatim)
   visual_trick = {trick}    (echo verbatim)
-  image_prompt              (one paragraph; cinematic, specific, vertical)
-  motion_prompt             (one sentence; specific subject motion + subtle camera)
+  image_prompt              (50-100 words, covers ALL six items in rule 6)
+  motion_prompt             (one full sentence; subject motion + camera move
+                             + what the motion REVEALS or DEMONSTRATES)
 """
 
 
@@ -179,6 +195,9 @@ async def _direct_one(
     motif_description: str,
     topic_familiarity: str = "hot",
     content_mode: str = "general",
+    article_thesis: str = "",
+    article_takeaway: str = "",
+    article_examples: list[str] | None = None,
 ) -> ShotPlanV2:
     system = _build_system(
         tone=tone,
@@ -190,12 +209,30 @@ async def _direct_one(
         topic_familiarity=topic_familiarity,
         content_mode=content_mode,
     )
+    examples_block = ""
+    if article_examples:
+        examples_block = (
+            "\n\nARTICLE EXAMPLES (real things named in the paper — use one\n"
+            "or more in your image if they fit this beat):\n"
+            + "\n".join(f"  - {e}" for e in article_examples[:6])
+        )
+    article_block = ""
+    if article_thesis or article_takeaway:
+        article_block = (
+            f"\n\nARTICLE CONTEXT (so the shot stays anchored to the real paper,\n"
+            f"not a generic version of the topic):\n"
+            f"  thesis  : {article_thesis}\n"
+            f"  takeaway: {article_takeaway}"
+            + examples_block
+        )
     user = (
         f"VO LINE FOR THIS SHOT:\n  {scene.sentence!r}\n\n"
-        f"CAPTION (don't restate — design visuals that complement it):\n"
+        f"CAPTION OVERLAY (will be burned on top — design visuals that\n"
+        f"  complement it, NEVER duplicate it):\n"
         f"  {scene.caption!r}\n\n"
         f"Role in arc: {scene.role}\n"
         f"Duration: ~{scene.est_duration_s:.1f}s"
+        f"{article_block}"
     )
     out = await app.ai(system=system, user=user, schema=ShotPlanV2)
     # Force-preserve the assigned anchor/trick (model occasionally drifts).
@@ -213,9 +250,16 @@ async def direct_shots_v2(
     vocab: VisualVocabulary,
     topic_familiarity: str = "hot",
     content_mode: str = "general",
+    article_thesis: str = "",
+    article_takeaway: str = "",
+    article_examples: list[str] | None = None,
 ) -> list[ShotPlanV2]:
     """Plan the visual arc once (vocabulary-grounded + familiarity-aware),
-    then run per-scene directors in parallel with their assigned motif."""
+    then run per-scene directors in parallel with their assigned motif.
+
+    article_* args give the director paper-level grounding so prompts
+    stay anchored to THIS paper instead of generic "AI research" mood.
+    """
     arc = await plan_visual_arc(
         app, scenes, tone, full_script, vocab,
         topic_familiarity=topic_familiarity,
@@ -241,6 +285,9 @@ async def direct_shots_v2(
             motif_description=motif.description,
             topic_familiarity=topic_familiarity,
             content_mode=content_mode,
+            article_thesis=article_thesis,
+            article_takeaway=article_takeaway,
+            article_examples=article_examples,
         )
 
     return list(await asyncio.gather(*(_one(s) for s in scenes)))

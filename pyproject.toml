@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reel-af"
+version = "0.1.0"
+description = "URL → vertical reel: multi-agent pipeline for viral short-form video"
+requires-python = ">=3.10"
+dependencies = [
+    "agentfield",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "aiohttp>=3.9",
+    "readability-lxml>=0.8",
+    "lxml[html_clean]>=5.0",
+    "typer>=0.12",
+    "rich>=13.0",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+reel-af = "reel_af.cli:app"
+reel-af-server = "reel_af.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]

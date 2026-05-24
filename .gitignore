@@ -1,0 +1,9 @@
+.venv/
+.env
+output/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.plandb.db*
+.DS_Store

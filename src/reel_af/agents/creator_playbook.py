@@ -151,36 +151,40 @@ Length: 35-50 seconds (90-130 words). Papers have more substance to
 convey than a news article. Don't pad — but don't cram either.
 
 ──────────────────────────────────────────────────────────────────────────
-CALIBRATION
+CALIBRATION — fictional papers, shape-only
 ──────────────────────────────────────────────────────────────────────────
+IMPORTANT: the examples below are FICTIONAL training data, NOT real
+papers. Do NOT reproduce any names, numbers, or claims from them in your
+actual script. They exist only to show you the SHAPE — lead with the
+result, name the method, give a baseline, close on the consequence. Use
+the REAL paper's content from the article summary you were given.
 
-Paper: "DeepSeek-V3.1 — 671B MoE model with multi-head latent attention"
+Fictional paper: "FICTNET-A — 999B MoE model with paired latent routing"
 
 ✗ BAD (general-audience explainer style applied to a technical paper):
-  "Have you heard of DeepSeek? It's an AI model. They made it bigger."
+  "Have you heard of FICTNET? It's an AI model. They made it bigger."
   (Why bad: insults the technical audience, wastes time defining things
    they know, hides the actual contribution.)
 
+✓ GOOD (note the SHAPE — lead-result, named-method, baseline, close):
+  "FICTNET-A — 999B parameters but only 42B active per token. They use
+   paired latent routing to keep inference cheap. The trick: a learned
+   token assignment that cuts the KV cache by 8x. Beats the prior open
+   SOTA on 10 of 12 reasoning benchmarks. The headline isn't the score.
+   It's the latency — frontier quality at edge-device cost."
+
+Fictional paper: "EXAMPLENET-Q — 1-bit transformers match full-precision"
+
+✗ BAD: "Imagine if you could compress AI models. That's what EXAMPLENET does."
+
 ✓ GOOD:
-  "DeepSeek-V3.1 just dropped. 671 billion parameters but only 37B
-   active per token — they use mixture-of-experts to keep inference
-   cheap. The trick: multi-head latent attention, which compresses the
-   KV cache to a tiny fraction. Trained on 14.8 trillion tokens for
-   $5.5M. Beats GPT-4o on 12 of 14 benchmarks. The headline isn't the
-   score. It's the cost — open-weights inference at frontier quality."
-
-Paper: "BitNet b1.58 — 1-bit transformers match FP16"
-
-✗ BAD: "Imagine if you could compress AI models. That's what BitNet does."
-
-✓ GOOD:
-  "Microsoft just trained a 1-bit transformer that matches FP16. Yes,
-   one bit per weight — values of -1, 0, or +1. At 3 billion parameters
-   they hit GPT-3-class perplexity. The catch was they couldn't make it
-   work as a post-training quantization — they had to train it 1-bit
-   from scratch. Inference is 4-6x faster on GPU, and the math suggests
-   custom hardware could push that to 50x. Quantization isn't a
-   compression trick anymore. It's a new training regime."
+  "EXAMPLENET-Q trained a 1-bit transformer that matches full-precision.
+   Yes, one bit per weight — values of -1, 0, or +1. At their target
+   scale they hit baseline perplexity. The catch: post-training
+   quantization didn't work; they had to train 1-bit from scratch.
+   Inference is meaningfully faster on GPU, with room for purpose-built
+   hardware. Quantization isn't a compression trick anymore — it's a
+   new training regime."
 ══════════════════════════════════════════════════════════════════════════
 """
 

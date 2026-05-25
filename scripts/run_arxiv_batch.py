@@ -17,9 +17,9 @@ CONTROL_PLANE = "http://localhost:8080"
 TIMEOUT_S = 1800
 
 PAPERS = [
-    ("math_primes",   "https://arxiv.org/abs/2502.20825"),  # math
-    ("physics_dm",    "https://arxiv.org/abs/2502.17575"),  # physics dark matter / cosmology
-    ("chem_catalyst", "https://arxiv.org/abs/2502.09950"),  # chemistry catalyst
+    ("meta_llama2",          "https://arxiv.org/abs/2307.09288"),  # Meta Llama 2
+    ("meta_code_llama",      "https://arxiv.org/abs/2308.12950"),  # Meta Code Llama
+    ("apple_intelligence_v2","https://arxiv.org/abs/2407.21075"),  # Apple Intelligence (retry)
 ]
 
 

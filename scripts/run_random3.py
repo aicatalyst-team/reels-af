@@ -28,7 +28,7 @@ async def _kick_off(session, genre, url):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     payload = {"input": {"url": url, "out_dir": out_dir}}
     async with session.post(
-        f"{CONTROL_PLANE}/api/v1/execute/async/reel-af.reel_generate",
+        f"{CONTROL_PLANE}/api/v1/execute/async/reel-af.reel_article_to_reel",
         json=payload,
     ) as resp:
         body = await resp.text()

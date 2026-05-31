@@ -28,7 +28,7 @@ for entry in "${ARTICLES[@]}"; do
   echo " [$genre]  $url"
   echo "=========================================================================="
 
-  exec_id=$(/usr/bin/curl -sS -X POST "http://localhost:8080/api/v1/execute/async/reel-af.reel_generate" \
+  exec_id=$(/usr/bin/curl -sS -X POST "http://localhost:8080/api/v1/execute/async/reel-af.reel_article_to_reel" \
     -H "Content-Type: application/json" \
     -d "{\"input\":{\"url\":\"$url\",\"out_dir\":\"$out_dir\"}}" \
     | python3 -c "import json,sys; print(json.load(sys.stdin).get('execution_id',''))")

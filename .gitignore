@@ -1,9 +1,36 @@
-.venv/
-.env
-output/
-*.egg-info/
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+
+# Pipeline outputs (renders + intermediates)
+output/
+
+# Tooling caches
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 .plandb.db*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db

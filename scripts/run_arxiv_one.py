@@ -31,7 +31,7 @@ async def main():
         # Kick off
         payload = {"input": {"url": url, "out_dir": out_dir}}
         async with s.post(
-            f"{CONTROL_PLANE}/api/v1/execute/async/reel-af.reel_generate",
+            f"{CONTROL_PLANE}/api/v1/execute/async/reel-af.reel_article_to_reel",
             json=payload,
         ) as resp:
             body = await resp.text()

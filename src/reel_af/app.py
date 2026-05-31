@@ -1,49 +1,48 @@
-"""reel-af AgentField agent — proper reasoner DAG.
+"""reel-af — turn a URL or a topic into a vertical viral reel.
 
-Architecture (each reasoner is one cognitive unit; entry orchestrates via
-app.call() so the control plane sees the full workflow DAG):
+Two entry reasoners; everything else is a supporting reasoner in the
+control-plane DAG so the workflow is fully introspectable.
 
-  generate (entry)
-     │
-     ├─ extract_source       (URL → SourceContent: navigate + distill)
-     ├─ compose_script       (SourceContent → ReelDraft: router + I/F arch)
-     ├─ plan_scenes_visuals  (script → Scenes + Vocab + Visual Arc)
-     │
-     │   ┌── async parallel ──┐
-     ├──┤ generate_shot_plans (per-scene shot prompts)
-     │   └── synthesize_audio (continuous TTS + silence-split)
-     │
-     ├─ generate_videos      (grok-imagine → Veo i2v per scene, parallel)
-     └─ assemble_final       (ffmpeg per-segment parallel + concat)
+    article_to_reel(url)   ─┐
+                            │   shared downstream:
+    topic_to_reel(topic)   ─┤   synthesize_audio → pack_cards → plan_beats
+                                → plan_visuals ∥ plan_accents
+                                → generate_videos → stitch_reel
+                                → final mp4
 
-Run pattern (3 terminals):
+Article path:
+    URL → extract_essence → compose_script → (audio, beats, visuals,
+    accents, videos) → stitch_reel
 
-  # 1. start the control plane
-  af server
+Topic path (multi-reasoner hunter cascade):
+    topic → 4 parallel hunters (specific_figure, reversal, temporal,
+            cross_domain) producing 12 candidates → critic picks top 3
+            → 3 parallel narrators write delayed-reveal scripts →
+            pairwise judge picks the winner → the same downstream
+            audio/beats/visuals/accents/videos/stitch path.
 
-  # 2. start the reel-af agent (registers + listens on :8002)
-  cd examples/reel-af
-  uv run python -m reel_af.app
+Run the agent (registers with the AgentField control plane, serves
+reasoners on :8002):
 
-  # 3. ASYNC invoke — gets execution_id immediately, no 90s timeout
-  EXEC=$(curl -sS -X POST http://localhost:8080/api/v1/execute/async/reel-af.reel_generate \\
-    -H 'Content-Type: application/json' \\
-    -d '{"input":{"url":"https://example.com/article"}}' | jq -r .execution_id)
-  while :; do
-    R=$(curl -sS http://localhost:8080/api/v1/executions/$EXEC)
-    S=$(echo "$R" | jq -r .status)
-    case "$S" in
-      succeeded) echo "$R" | jq .result; break ;;
-      failed)    echo "$R" | jq .;       break ;;
-      *)         sleep 5 ;;
-    esac
-  done
+    af server                                  # control plane
+    cd examples/reel-af && uv run python -m reel_af.app
+
+Invoke async, get an execution_id immediately:
+
+    curl -X POST http://localhost:8080/api/v1/execute/async/reel-af.reel_article_to_reel \\
+        -H 'Content-Type: application/json' \\
+        -d '{"input":{"url":"https://example.com/article"}}'
+
+    curl -X POST http://localhost:8080/api/v1/execute/async/reel-af.reel_topic_to_reel \\
+        -H 'Content-Type: application/json' \\
+        -d '{"input":{"topic":"philosophy of mind"}}'
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -51,844 +50,280 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-# Load .env BEFORE importing agentfield so API keys are present.
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(_PROJECT_ROOT / ".env")
 
 from agentfield import Agent, AgentRouter, AIConfig  # noqa: E402
 
-# Apply SDK bug-fixes (see AGENTFIELD_SDK_ISSUES.md) at startup so every
-# call to OpenRouterProvider gets the fixed behaviour. Module is idempotent.
+# Apply SDK bug-fixes at startup so every OpenRouterProvider call gets
+# the fixed behaviour. Module is idempotent.
 import reel_af.sdk_patches  # noqa: E402, F401
 
 app = Agent(
     node_id=os.getenv("AGENT_NODE_ID", "reel-af"),
     agentfield_server=os.getenv("AGENTFIELD_SERVER", "http://localhost:8080"),
-    version="0.1.0",
-    description="URL → vertical viral reel via a multi-reasoner DAG.",
+    version="1.0.0",
+    description="URL or topic → vertical viral reel via a multi-reasoner DAG.",
     ai_config=AIConfig(
-        model=os.getenv("REEL_AF_ANGLE_MODEL", "openrouter/deepseek/deepseek-v4-pro"),
+        model=os.getenv("REEL_AF_MODEL", "openrouter/deepseek/deepseek-v4-pro"),
         api_key=os.environ.get("OPENROUTER_API_KEY", ""),
         api_base="https://openrouter.ai/api/v1",
     ),
     dev_mode=True,
 )
 
-# All reel reasoners live under prefix "reel" → invoked as `reel-af.reel_<name>`.
+# All reel reasoners live under prefix "reel".
 reel = AgentRouter(prefix="reel", tags=["video", "viral"])
 
 
 # ════════════════════════════════════════════════════════════════════
-# PHASE REASONERS — each is one cognitive unit
+# Article-only reasoners — URL → Essence → ScriptDraft
 # ════════════════════════════════════════════════════════════════════
 
 
 @reel.reasoner()
-async def extract_source(url: str) -> dict:
-    """Phase 1 — navigate + distill: URL → structured article summary.
+async def extract_essence(url: str) -> dict:
+    """Phase 1 — URL → Essence (one harness call).
 
-    Combines fetch + clean + AI-extracted claims + AI-distilled thesis.
-    Returns the SourceContent and ArticleSummary as nested dicts.
+    Fetches the article, distills the most surprising claim + mechanism
+    + evidence + content_mode + domain in one structured pass.
     """
-    from reel_af.agents.distiller import distill
-    from reel_af.agents.navigator import navigate
+    from reel_af.agents.extract import extract_essence as _extract
 
-    source = await navigate(app, url)
-    summary = await distill(app, source)
-    return {
-        "source": source.model_dump(),
-        "summary": summary.model_dump(),
-    }
-
-
-@reel.reasoner()
-async def compose_script(summary: dict) -> dict:
-    """Phase 2 — pick direction (router) + write script (arch I or F).
-
-    The router selects whichever architecture historically wins on this
-    article's direction; the chosen architecture writes the script.
-    """
-    from reel_af.agents.distiller import ArticleSummary
-    from reel_af.agents.story_router import route_and_run
-
-    article_summary = ArticleSummary(**summary)
-    routed = await route_and_run(app, article_summary)
-    return {
-        "draft": routed.draft.model_dump(),
-        "direction": routed.draft.direction,
-        "chosen_arch": routed.chosen_arch,
-        "self_score": routed.arch_output.self_score,
-        "arch_trace": routed.arch_output.trace,
-    }
-
-
-@reel.reasoner()
-async def break_scenes_step(script: str) -> dict:
-    """Sub-reasoner: split the script into scenes + first-pass captions.
-
-    First-pass captions are paraphrases (just to have something) — the
-    captioner reasoner rewrites them contrapuntally with the article
-    summary in context.
-    """
-    from reel_af.agents.scene_breaker import break_scenes
-    scenes = await break_scenes(app, script)
-    return {
-        "scenes": [
-            {"idx": s.idx, "sentence": s.sentence, "caption": s.caption,
-             "est_duration_s": s.est_duration_s, "role": s.role}
-            for s in scenes
-        ]
-    }
-
-
-@reel.reasoner()
-async def tag_inject_step(script: str) -> dict:
-    """Sub-reasoner: insert Gemini Flash TTS inline audio tags.
-
-    Returns the same script with [excited]/[pause]/[emphasis]/...
-    bracketed cues woven in. Gemini reads the words and treats the tags
-    as stage directions — never spoken. Used as the input to TTS so
-    delivery direction stays out of the spoken text.
-    """
-    from reel_af.agents.tag_injector import inject_tags
-    tagged = await inject_tags(app, script)
-    return {"script_with_tags": tagged}
-
-
-@reel.reasoner()
-async def rewrite_captions_step(
-    scenes: list[dict], summary: dict, full_script: str,
-) -> dict:
-    """Sub-reasoner: rewrite per-scene captions to be CONTRAPUNTAL.
-
-    Replaces the paraphrase captions from break_scenes_step with ones
-    that add information the voice doesn't say — the specific number,
-    the named result, the jargon translation, the punchline early.
-    """
-    from reel_af.agents.captioner import rewrite_captions
-    from reel_af.agents.distiller import ArticleSummary
-    from reel_af.agents.scene_breaker import Scene
-    article_summary = ArticleSummary(**summary)
-    scene_objs = [Scene(**s) for s in scenes]
-    rewritten = await rewrite_captions(
-        app, scene_objs, article_summary, full_script,
-    )
-    return {
-        "scenes": [
-            {"idx": s.idx, "sentence": s.sentence, "caption": s.caption,
-             "est_duration_s": s.est_duration_s, "role": s.role}
-            for s in rewritten
-        ]
-    }
-
-
-@reel.reasoner()
-async def build_vocab_step(summary: dict) -> dict:
-    """Sub-reasoner: build article-specific visual vocabulary motifs."""
-    from reel_af.agents.distiller import ArticleSummary
-    from reel_af.agents.visual_vocab import build_vocabulary
-    article_summary = ArticleSummary(**summary)
-    vocab = await build_vocabulary(app, article_summary)
-    return {"vocabulary": vocab.model_dump()}
-
-
-@reel.reasoner()
-async def plan_visual_arc_step(
-    scenes: list[dict], vocabulary: dict, tone: str, script: str,
-    topic_familiarity: str = "hot",
-    content_mode: str = "general",
-) -> dict:
-    """Sub-reasoner: assign anchor + visual_trick + motif per scene.
-
-    Depends on BOTH break_scenes_step and build_vocab_step — the planner
-    above fan-outs those two in parallel, then calls this one with both
-    outputs. That's the depth-3 DAG: entry → planner → these subs.
-
-    `topic_familiarity` and `content_mode` switch the visual planner into
-    the right register (accessibility for obscure topics; scientific-
-    technical for papers).
-    """
-    from reel_af.agents.scene_breaker import Scene
-    from reel_af.agents.visual_arc import plan_visual_arc
-    from reel_af.agents.visual_vocab import VisualVocabulary
-    scene_objs = [Scene(**s) for s in scenes]
-    vocab_obj = VisualVocabulary(**vocabulary)
-    arc = await plan_visual_arc(
-        app, scene_objs, tone=tone, full_script=script, vocab=vocab_obj,
-        topic_familiarity=topic_familiarity,
-        content_mode=content_mode,
-    )
-    return {"visual_arc": [p.model_dump() for p in arc]}
-
-
-@reel.reasoner()
-async def plan_scenes_visuals(
-    summary: dict, script: str, tone: str = "wonder",
-    topic_familiarity: str = "hot",
-    content_mode: str = "general",
-) -> dict:
-    """Phase 3 — composes 3 sub-reasoners via app.call() (depth-3 DAG).
-
-    Fans out scene-breaking ∥ vocab-building (both depend only on inputs),
-    then chains into arc-planning (depends on both outputs). The control
-    plane records ALL of this as a workflow DAG you can inspect / replay.
-    """
-    node = app.node_id
-    scenes_task = asyncio.create_task(
-        app.call(f"{node}.reel_break_scenes_step", script=script)
-    )
-    vocab_task = asyncio.create_task(
-        app.call(f"{node}.reel_build_vocab_step", summary=summary)
-    )
-    scenes_resp, vocab_resp = await asyncio.gather(scenes_task, vocab_task)
-    arc_resp = await app.call(
-        f"{node}.reel_plan_visual_arc_step",
-        scenes=scenes_resp["scenes"], vocabulary=vocab_resp["vocabulary"],
-        tone=tone, script=script, topic_familiarity=topic_familiarity,
-        content_mode=content_mode,
-    )
-    return {
-        "scenes": scenes_resp["scenes"],
-        "vocabulary": vocab_resp["vocabulary"],
-        "visual_arc": arc_resp["visual_arc"],
-    }
-
-
-@reel.reasoner()
-async def generate_shot_plans(
-    scenes: list[dict], visual_arc: list[dict], vocabulary: dict,
-    tone: str, full_script: str,
-    topic_familiarity: str = "hot",
-    content_mode: str = "general",
-    article_thesis: str = "",
-    article_takeaway: str = "",
-    article_examples: list[str] | None = None,
-) -> dict:
-    """Phase 4a — per-scene shot plans (image prompt + motion prompt).
-
-    Runs in parallel with synthesize_audio (no dependency between them).
-    `topic_familiarity` and `content_mode` switch the shot director into
-    the right register (obscure-accessibility or scientific-technical).
-    `article_*` give the director paper-level grounding so the visuals
-    stay anchored to THIS paper, not a generic "AI research" mood.
-    """
-    from reel_af.agents.scene_breaker import Scene
-    from reel_af.agents.shot_director_v2 import _direct_one
-    from reel_af.agents.visual_arc import SceneVisualPlan
-    from reel_af.agents.visual_vocab import VisualVocabulary
-
-    vocab = VisualVocabulary(**vocabulary)
-    motif_by_id = {m.motif_id: m for m in vocab.motifs}
-    arc_by_idx = {a["scene_idx"]: SceneVisualPlan(**a) for a in visual_arc}
-
-    async def _one(scene_dict: dict):
-        scene = Scene(**scene_dict)
-        plan = arc_by_idx.get(scene.idx)
-        if plan is None:
-            # Arc planner skipped this scene_idx — fall back to a sensible
-            # default anchored on the first vocabulary motif rather than
-            # crashing the whole pipeline.
-            plan = SceneVisualPlan(
-                scene_idx=scene.idx,
-                anchor_type="literal",
-                visual_trick="isolated_object",
-                motif_id=vocab.motifs[0].motif_id,
-                one_line_concept=scene.sentence,
-            )
-        motif = motif_by_id.get(plan.motif_id, vocab.motifs[0])
-        result = await _direct_one(
-            app, scene, plan, tone, full_script,
-            motif_description=motif.description,
-            topic_familiarity=topic_familiarity,
-            content_mode=content_mode,
-            article_thesis=article_thesis,
-            article_takeaway=article_takeaway,
-            article_examples=article_examples,
-        )
-        return result.model_dump()
-
-    plans = await asyncio.gather(*(_one(s) for s in scenes))
-    return {"plans": plans}
-
-
-@reel.reasoner()
-async def synthesize_audio(
-    full_script: str, scenes: list[dict], voice_tone: str, out_dir: str,
-) -> dict:
-    """Phase 4b — single continuous TTS call + sentence-boundary split.
-
-    Generates the WHOLE script as one utterance (preserves prosody) then
-    splits at silences for per-scene video alignment.
-    """
-    from reel_af.agents.scene_breaker import Scene
-    from reel_af.agents.tts_continuous import generate_continuous_audio, voice_for_tone
-
-    scene_objs = [Scene(**s) for s in scenes]
-    voice = voice_for_tone(voice_tone)
-    artifacts, full_audio = await generate_continuous_audio(
-        full_script=full_script,
-        scenes=scene_objs,
-        voice=voice,
-        out_dir=Path(out_dir),
-        tone=voice_tone,
-    )
-    # Measure each per-scene audio so video gen can size Veo clips to the
-    # ACTUAL spoken duration (word-count estimates under-shoot, which makes
-    # the video freeze on the last frame while the audio finishes).
-    import subprocess
-    def _probe(path: Path) -> float:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-            capture_output=True, text=True, check=True,
-        )
-        return float(out.stdout.strip())
-    return {
-        "voice": voice,
-        "full_audio_path": str(full_audio),
-        "segments": [
-            {
-                "idx": a.idx,
-                "audio_path": str(a.audio_path),
-                "duration_s": _probe(a.audio_path),
-            }
-            for a in artifacts
-        ],
-    }
-
-
-@reel.reasoner()
-async def gen_first_frame_step(
-    scene_idx: int, plan: dict, out_dir: str,
-    content_mode: str = "general",
-) -> dict:
-    """Sub-reasoner: image-gen produces a vertical first frame.
-
-    content_mode picks the style note layered onto the prompt
-    (cinematic-doc for general, clinical-lab for scientific).
-    """
-    from agentfield.media_providers import OpenRouterProvider
-
-    from reel_af.agents.shot_director_v2 import ShotPlanV2
-    from reel_af.agents.video_gen import _gen_first_frame
-
-    provider = OpenRouterProvider()
-    plan_obj = ShotPlanV2(**plan)
-    frame_path = await _gen_first_frame(
-        provider, plan_obj, scene_idx, Path(out_dir),
-        content_mode=content_mode,
-    )
-    return {"scene_idx": scene_idx, "frame_path": str(frame_path)}
-
-
-@reel.reasoner()
-async def gen_video_from_frame_step(
-    scene_idx: int, plan: dict, scene: dict, frame_path: str, out_dir: str,
-    target_duration_s: float | None = None,
-    content_mode: str = "general",
-) -> dict:
-    """Sub-reasoner: Veo image-to-video using the prior step's first frame.
-
-    target_duration_s — REAL spoken duration of this scene's audio. We
-    size the Veo clip with enough headroom to cover that (so the trim in
-    assembly cuts off the spare, instead of holding the last frame as a
-    visible freeze). Falls back to scene.est_duration_s if not provided.
-
-    On Veo failure (most often: content-moderation false positive) we
-    render a still + ken-burns fallback so the reel still assembles.
-    """
-    from agentfield.media_providers import OpenRouterProvider
-
-    from reel_af.agents.scene_breaker import Scene
-    from reel_af.agents.shot_director_v2 import ShotPlanV2
-    from reel_af.agents.video_gen import _gen_video, _still_as_video
-
-    provider = OpenRouterProvider()
-    plan_obj = ShotPlanV2(**plan)
-    scene_obj = Scene(**scene)
-    used_fallback = False
-    try:
-        video_path = await _gen_video(
-            provider, plan_obj, scene_obj, Path(frame_path), Path(out_dir),
-            target_duration_s=target_duration_s,
-            content_mode=content_mode,
-        )
-    except Exception as e:
-        print(f"[app.gen_video_from_frame_step] scene {scene_idx} Veo failed ({e}); still fallback.")
-        fallback = Path(out_dir) / f"seg-{scene_idx:02d}-fallback.mp4"
-        # Match the still's duration to the actual spoken duration so the
-        # ken-burns doesn't freeze either.
-        dur = target_duration_s if target_duration_s else 4.0
-        video_path = await _still_as_video(Path(frame_path), dur + 0.5, fallback)
-        used_fallback = True
-    return {
-        "scene_idx": scene_idx,
-        "video_path": str(video_path),
-        "used_fallback": used_fallback,
-    }
-
-
-@reel.reasoner()
-async def generate_videos_phase(
-    scenes: list[dict], plans: list[dict], out_dir: str,
-    audio_durations: dict[str, float] | None = None,
-    content_mode: str = "general",
-) -> dict:
-    """Phase 5 — orchestrates per-scene (first_frame → veo) via app.call().
-
-    Each scene is a 2-step chain (frame → video). All scenes run in
-    parallel via asyncio.gather. The control plane records every node:
-    `generate_videos_phase` → per-scene `gen_first_frame_step` then
-    `gen_video_from_frame_step`. Depth-3 DAG inside this phase.
-
-    audio_durations: {str(scene_idx): seconds} from the audio phase, so
-    video clips are sized to the ACTUAL spoken length (not the
-    word-count estimate that under-shoots and causes freezes).
-    """
-    node = app.node_id
-    audio_durations = audio_durations or {}
-
-    async def _one_scene(scene_dict: dict, plan_dict: dict) -> dict:
-        idx = scene_dict["idx"]
-        target_dur = audio_durations.get(str(idx))
-        frame_resp = await app.call(
-            f"{node}.reel_gen_first_frame_step",
-            scene_idx=idx, plan=plan_dict, out_dir=out_dir,
-            content_mode=content_mode,
-        )
-        video_resp = await app.call(
-            f"{node}.reel_gen_video_from_frame_step",
-            scene_idx=idx, plan=plan_dict, scene=scene_dict,
-            frame_path=frame_resp["frame_path"], out_dir=out_dir,
-            target_duration_s=target_dur,
-            content_mode=content_mode,
-        )
-        return {"idx": idx, "video_path": video_resp["video_path"]}
-
-    videos = await asyncio.gather(
-        *(_one_scene(s, p) for s, p in zip(scenes, plans))
-    )
-    return {"videos": list(videos)}
-
-
-@reel.reasoner()
-async def assemble_final(
-    scenes: list[dict], plans: list[dict],
-    video_segments: list[dict], audio_segments: list[dict],
-    direction: str, hook_trick: str, retention_trick: str, close_trick: str,
-    viral_score: int, out_dir: str, run_id: str,
-) -> dict:
-    """Phase 6 — concat per-segment ffmpeg renders into the final reel.mp4."""
-    from reel_af.agents.scene_breaker import Scene
-    from reel_af.agents.shot_director_v2 import ShotPlanV2
-    from reel_af.assembly.ffmpeg_stitch_v2 import stitch_v2
-    from reel_af.models import AngleProposal, Beat, BeatArtifact, Storyboard
-
-    scene_objs = [Scene(**s) for s in scenes]
-    plan_objs = [ShotPlanV2(**p) for p in plans]
-    video_artifacts = [BeatArtifact(idx=v["idx"], image_path=Path(v["video_path"])) for v in video_segments]
-    audio_artifacts = [BeatArtifact(idx=a["idx"], audio_path=Path(a["audio_path"])) for a in audio_segments]
-
-    sb = Storyboard(
-        angle=AngleProposal(
-            frame="pattern_interrupt",
-            hook_line=scene_objs[0].sentence,
-            angle=" ".join(s.sentence for s in scene_objs),
-            why_works=f"hook={hook_trick} retention={retention_trick} close={close_trick}",
-            predicted_score=viral_score,
-        ),
-        beats=[
-            Beat(
-                idx=s.idx, duration_s=s.est_duration_s,
-                image_prompt=p.image_prompt, caption=s.caption,
-                vo_line=s.sentence, motion_hint="static",
-            )
-            for s, p in zip(scene_objs, plan_objs)
-        ],
-        total_duration_s=sum(s.est_duration_s for s in scene_objs),
-        style_notes="",
-    )
-    result = await stitch_v2(
-        segments=scene_objs, plans=plan_objs,
-        video_artifacts=video_artifacts, audio_artifacts=audio_artifacts,
-        out_dir=Path(out_dir), run_id=run_id, storyboard_for_result=sb,
-    )
-    return {
-        "video_path": str(result.output_path),
-        "duration_s": result.duration_s,
-    }
-
-
-# ════════════════════════════════════════════════════════════════════
-# ENTRY REASONER — orchestrates the DAG via app.call()
-# ════════════════════════════════════════════════════════════════════
-
-
-@reel.reasoner()
-async def generate(url: str, out_dir: str | None = None) -> dict:
-    """Entry point — composes the reel via app.call() to each phase reasoner.
-
-    Each app.call() goes through the control plane, so the workflow DAG is
-    visible in the UI + you can rerun individual phases for debugging.
-
-    Example:
-      curl -X POST http://localhost:8080/api/v1/execute/async/reel-af.reel_generate \\
-        -H 'Content-Type: application/json' \\
-        -d '{"input":{"url":"https://example.com/article"}}'
-    """
-    if "OPENROUTER_API_KEY" not in os.environ:
-        return {"error": "OPENROUTER_API_KEY not set in env."}
-
-    run_id = uuid.uuid4().hex[:8]
-    out_path = Path(out_dir) if out_dir else (Path.cwd() / "output" / run_id)
-    out_path.mkdir(parents=True, exist_ok=True)
-    media_dir = out_path / "media"
-    media_dir.mkdir(parents=True, exist_ok=True)
-
-    timings: dict[str, float] = {}
-    node = app.node_id
-    app.note(f"reel-af: starting run {run_id} for {url}", tags=["reel", "start"])
-    t_pipeline = time.time()
-
-    # ───────────────────────────────────────────────────────────────
-    # Dependency graph (* = parallel branches):
-    #   extract_source                                  (serial — root)
-    #     │
-    #     ├── compose_script ──┐
-    #     └── build_vocab    *─┤                        (vocab only needs summary)
-    #                          ↓
-    #                       break_scenes                 (needs script)
-    #                          ↓
-    #     ┌── plan_visual_arc ─┴── synthesize_audio *   (audio only needs script+scenes)
-    #     ↓
-    #     generate_shot_plans                            (needs arc + vocab)
-    #     ↓
-    #     generate_videos_phase   ←── (audio task still in flight if slow)
-    #     ↓
-    #     await audio_task                               (almost always already done)
-    #     ↓
-    #     assemble_final
-    # ───────────────────────────────────────────────────────────────
-
-    # 1. extract_source — serial root.
-    t = time.time()
-    extracted = await app.call(f"{node}.reel_extract_source", url=url)
-    timings["extract_source"] = round(time.time() - t, 1)
-    summary = extracted["summary"]
-
-    # topic_familiarity drives obscure-vs-hot accessibility register;
-    # content_mode drives general-vs-scientific. Both propagate through
-    # vocabulary, arc, and shot director.
-    topic_familiarity = summary.get("topic_familiarity", "hot")
-    content_mode = summary.get("content_mode", "general")
-
-    # 2. compose_script ∥ build_vocab_step — vocab only needs summary, so
-    # fire it now to hide its 30-60s cost under compose_script's ~150s cost.
-    t = time.time()
-    compose_task = asyncio.create_task(
-        app.call(f"{node}.reel_compose_script", summary=summary)
-    )
-    vocab_task = asyncio.create_task(
-        app.call(f"{node}.reel_build_vocab_step", summary=summary)
-    )
-    composed = await compose_task
-    timings["compose_script"] = round(time.time() - t, 1)
-    draft = composed["draft"]
-
-    # 3. break_scenes ∥ tag_inject — both only need draft.script and are
-    # independent. tag_inject produces the script with Gemini Flash TTS
-    # inline tags ([curious]/[pause]/[emphasis]/...) so delivery direction
-    # never leaks into the spoken audio.
-    t = time.time()
-    scenes_task = asyncio.create_task(app.call(
-        f"{node}.reel_break_scenes_step", script=draft["script"]
-    ))
-    tag_task = asyncio.create_task(app.call(
-        f"{node}.reel_tag_inject_step", script=draft["script"]
-    ))
-    scenes_resp = await scenes_task
-    scenes = scenes_resp["scenes"]
-    timings["break_scenes"] = round(time.time() - t, 1)
-
-    # 3b. Rewrite captions contrapuntally (uses summary + full script).
-    # Quick LLM call (~5s); fully in parallel with the upcoming audio + arc.
-    t = time.time()
-    captioner_task = asyncio.create_task(app.call(
-        f"{node}.reel_rewrite_captions_step",
-        scenes=scenes, summary=summary, full_script=draft["script"],
-    ))
-
-    # Wait for vocab (almost always already done).
-    vocab_resp = await vocab_task
-
-    # 4. plan_visual_arc ∥ synthesize_audio — independent:
-    #    arc needs vocab + scenes; audio needs script + scenes. Audio is the
-    #    slow one (~30-60s TTS) — start it now so it's done by the time we
-    #    finish shot_plans + videos.
-    t = time.time()
-    arc_task = asyncio.create_task(app.call(
-        f"{node}.reel_plan_visual_arc_step",
-        scenes=scenes, vocabulary=vocab_resp["vocabulary"],
-        tone=draft["voice_tone"], script=draft["script"],
-        topic_familiarity=topic_familiarity, content_mode=content_mode,
-    ))
-    # Pull the tagged script (almost always already done — it was kicked
-    # off back in step 3 parallel with break_scenes).
-    tagged_resp = await tag_task
-    tagged_script = tagged_resp["script_with_tags"]
-    audio_task = asyncio.create_task(app.call(
-        f"{node}.reel_synthesize_audio",
-        full_script=tagged_script, scenes=scenes,
-        voice_tone=draft["voice_tone"], out_dir=str(media_dir),
-    ))
-    arc_resp = await arc_task
-    timings["plan_visual_arc"] = round(time.time() - t, 1)
-
-    # Captioner is cheap and was running in parallel since break_scenes.
-    # Replace scenes with contrapuntal-caption versions before any agent
-    # downstream of here uses them (shot director gets the better caption,
-    # assembly burns the better caption).
-    captioned_resp = await captioner_task
-    scenes = captioned_resp["scenes"]
-
-    # 5. generate_shot_plans — needs arc + vocab. Audio still streaming in
-    # background. Pass article-level context so the director's image
-    # prompts stay grounded in THIS paper, not generic field aesthetics.
-    t = time.time()
-    shot_plans_resp = await app.call(
-        f"{node}.reel_generate_shot_plans",
-        scenes=scenes, visual_arc=arc_resp["visual_arc"],
-        vocabulary=vocab_resp["vocabulary"],
-        tone=draft["voice_tone"], full_script=draft["script"],
-        topic_familiarity=topic_familiarity, content_mode=content_mode,
-        article_thesis=summary.get("one_line_thesis", ""),
-        article_takeaway=summary.get("intended_takeaway", ""),
-        article_examples=summary.get("concrete_examples", []),
-    )
-    timings["generate_shot_plans"] = round(time.time() - t, 1)
-    plans = shot_plans_resp["plans"]
-
-    # Collect audio BEFORE kicking off video gen so we know each scene's
-    # ACTUAL spoken duration. Sizing Veo clips to estimated duration was
-    # under-shooting and the stitch step held the last frame on the freeze
-    # ("video pauses while voice runs"). Audio is short (~5-15s) compared
-    # to the arc+shot_plans we already overlapped — audio_wait is normally 0.
-    t = time.time()
-    audio_resp = await audio_task
-    timings["audio_wait"] = round(time.time() - t, 1)
-    audio_durations = {
-        str(seg["idx"]): seg["duration_s"]
-        for seg in audio_resp["segments"]
-    }
-
-    # 6. Video generation (Veo i2v per scene, parallel internally). Sized
-    # to actual audio durations + content_mode-aware style.
-    t = time.time()
-    videos_resp = await app.call(
-        f"{node}.reel_generate_videos_phase",
-        scenes=scenes, plans=plans, out_dir=str(media_dir),
-        audio_durations=audio_durations,
-        content_mode=content_mode,
-    )
-    timings["videos"] = round(time.time() - t, 1)
-
-    # 7. Assemble final reel.
-    t = time.time()
-    final = await app.call(
-        f"{node}.reel_assemble_final",
-        scenes=scenes, plans=plans,
-        video_segments=videos_resp["videos"],
-        audio_segments=audio_resp["segments"],
-        direction=draft["direction"],
-        hook_trick=draft["hook_trick"],
-        retention_trick=draft["retention_trick"],
-        close_trick=draft["close_trick"],
-        viral_score=draft["viral_score"],
-        out_dir=str(out_path), run_id=run_id,
-    )
-    timings["assemble"] = round(time.time() - t, 1)
-    timings["total"] = round(time.time() - t_pipeline, 1)
-
-    app.note(
-        f"reel-af: run {run_id} done → {final['video_path']}",
-        tags=["reel", "done"],
-    )
-    return {
-        "video_path": final["video_path"],
-        "duration_s": final["duration_s"],
-        "script": draft["script"],
-        "direction": draft["direction"],
-        "voice_tone": draft["voice_tone"],
-        "voice_id": audio_resp["voice"],
-        "tricks": {
-            "hook": draft["hook_trick"],
-            "retention": draft["retention_trick"],
-            "close": draft["close_trick"],
-        },
-        "self_score": composed["self_score"],
-        "chosen_arch": composed["chosen_arch"],
-        "captions": [s["caption"] for s in scenes],
-        "motifs": [m["motif_id"] for m in vocab_resp["vocabulary"]["motifs"]],
-        "content_mode": content_mode,
-        "topic_familiarity": topic_familiarity,
-        "audience_level": summary.get("audience_level", "general"),
-        "run_id": run_id,
-        "timings_s": timings,
-    }
-
-
-# ════════════════════════════════════════════════════════════════════
-# V2 PHASE REASONERS — each a discrete cognitive unit visible in the DAG
-# Entry: v2_generate orchestrates via app.call so the workflow is graphed.
-# See docs/ARCHITECTURE_V2.md for the design.
-# ════════════════════════════════════════════════════════════════════
-
-
-@reel.reasoner()
-async def v2_extract_essence(url: str) -> dict:
-    """V2 Phase 1 — URL → Essence (single LLM harness).
-
-    Replaces v1's navigate + distill split. One pass: fetch the article,
-    pull the most surprising claim, the mechanism, evidence, content_mode.
-    """
-    from reel_af.v2.agents.extract import extract_essence
-
-    essence = await extract_essence(app, url)
+    essence = await _extract(app, url)
     return {"essence": essence.model_dump()}
 
 
 @reel.reasoner()
-async def v2_compose_script(essence: dict) -> dict:
-    """V2 Phase 2 — Essence → ScriptDraft (single LLM .ai call).
+async def compose_script(essence: dict) -> dict:
+    """Phase 2 — Essence → ScriptDraft (one .ai() call).
 
-    Replaces v1's router + arch_b + arch_f + arch_i + tag_injector tower
-    with one fixed Hook → Mechanism → Payoff → Loop structure.
+    Fixed Hook → Mechanism → Payoff structure with inline Gemini TTS
+    audio tags. The schema's loop-back validator enforces the final
+    clause to echo a keyword from the hook so the reel rewatches.
     """
-    from reel_af.v2.agents.compose import compose_script
-    from reel_af.v2.models import Essence
+    from reel_af.agents.compose import compose_script as _compose
+    from reel_af.models import Essence
 
     e = Essence(**essence)
-    script = await compose_script(app, e)
+    script = await _compose(app, e)
     return {"script": script.model_dump()}
 
 
+# ════════════════════════════════════════════════════════════════════
+# Topic-only reasoners — 4 hunters + critic + narrator + judge
+# ════════════════════════════════════════════════════════════════════
+
+
 @reel.reasoner()
-async def v2_synthesize_audio(
+async def hunt_specific_figure(topic: str) -> dict:
+    """Hunter A — 3 candidates centered on a NAMED person most viewers
+    haven't heard of. Names the year, names the finding."""
+    from reel_af.agents.hunters import hunt_specific_figure as _hunt
+
+    candidates = await _hunt(app, topic)
+    return {"candidates": [c.model_dump() for c in candidates]}
+
+
+@reel.reasoner()
+async def hunt_reversal(topic: str) -> dict:
+    """Hunter B — 3 candidates where the common interpretation is
+    BACKWARDS, with the source of the reversal named."""
+    from reel_af.agents.hunters import hunt_reversal as _hunt
+
+    candidates = await _hunt(app, topic)
+    return {"candidates": [c.model_dump() for c in candidates]}
+
+
+@reel.reasoner()
+async def hunt_temporal(topic: str) -> dict:
+    """Hunter C — 3 candidates tied to a specific year/event that
+    reframes how we see the field."""
+    from reel_af.agents.hunters import hunt_temporal as _hunt
+
+    candidates = await _hunt(app, topic)
+    return {"candidates": [c.model_dump() for c in candidates]}
+
+
+@reel.reasoner()
+async def hunt_cross_domain(topic: str) -> dict:
+    """Hunter D — 3 candidates bridging the topic to an unexpected
+    other field, with the specific bridge-builder named."""
+    from reel_af.agents.hunters import hunt_cross_domain as _hunt
+
+    candidates = await _hunt(app, topic)
+    return {"candidates": [c.model_dump() for c in candidates]}
+
+
+@reel.reasoner()
+async def pick_top_essences(
+    topic: str, candidates: list[dict], n_top: int = 3,
+) -> dict:
+    """Critic — scores 12 candidates on novelty / specificity /
+    hookability / narratability and picks the top N preferring angle
+    diversity when scores are close."""
+    from reel_af.agents.critic import pick_top_essences as _crit
+    from reel_af.models import EssenceCandidate
+
+    cand_objs = [EssenceCandidate(**c) for c in candidates]
+    out = await _crit(app, topic, cand_objs, n=n_top)
+    chosen = [i for i in out.chosen_indices if 0 <= i < len(cand_objs)]
+    return {
+        "rankings": [r.model_dump() for r in out.rankings],
+        "chosen_indices": chosen,
+        "chosen_essences": [cand_objs[i].model_dump() for i in chosen],
+    }
+
+
+@reel.reasoner()
+async def write_narrations(essences: list[dict]) -> dict:
+    """Narrator fan-out — one delayed-reveal script per chosen essence
+    (parallel via asyncio.gather)."""
+    from reel_af.agents.narrator import write_narrations as _narr
+    from reel_af.models import EssenceCandidate
+
+    ess_objs = [EssenceCandidate(**e) for e in essences]
+    scripts = await _narr(app, ess_objs)
+    return {"scripts": [s.model_dump() for s in scripts]}
+
+
+@reel.reasoner()
+async def pick_best_narration(
+    topic: str, scripts: list[dict], essences: list[dict],
+) -> dict:
+    """Pairwise judge — picks the most viral script."""
+    from reel_af.agents.judge import pick_best_narration as _judge
+    from reel_af.models import ConversationalScript, EssenceCandidate
+
+    script_objs = [ConversationalScript(**s) for s in scripts]
+    ess_objs = [EssenceCandidate(**e) for e in essences]
+    if len(script_objs) == 1:
+        return {"winner_idx": 0, "composite_score": 7.0, "why": "only one"}
+    verdict = await _judge(app, topic, script_objs, ess_objs)
+    return verdict.model_dump()
+
+
+# ════════════════════════════════════════════════════════════════════
+# Shared downstream — audio, beats, visuals, accents, videos, stitch
+# ════════════════════════════════════════════════════════════════════
+
+
+@reel.reasoner()
+async def synthesize_audio(
     narration: str, voice_tone: str, out_dir: str,
 ) -> dict:
-    """V2 Phase 3 — narration → audio path + duration (TTS only)."""
-    from reel_af.v2.render.tts import synthesize_audio, voice_for_tone
+    """Sentence-by-sentence TTS + sample-accurate word timings.
+
+    Each sentence synthesizes independently (in parallel), is
+    sped-up via ffmpeg ``atempo`` (preserves pitch), measured with
+    ffprobe, then native-wave concatenated. Sentence boundaries are
+    sample-accurate on the final timeline; words within a sentence
+    are distributed by syllable count.
+    """
+    from reel_af.render.tts import (
+        strip_tts_tags,
+        synthesize_audio as _synth,
+        voice_for_tone,
+    )
 
     voice = voice_for_tone(voice_tone)
-    audio_path, duration_s = await synthesize_audio(
+    audio_path, word_timings = await _synth(
         narration=narration, voice=voice, out_dir=Path(out_dir),
     )
+    duration_s = word_timings[-1].end_s if word_timings else 0.0
     return {
         "audio_path": str(audio_path),
         "duration_s": duration_s,
         "voice": voice,
-    }
-
-
-@reel.reasoner()
-async def v2_align_audio(audio_path: str, narration: str) -> dict:
-    """V2 Phase 4 — forced alignment via whisper-cli.
-
-    Replaces the Path A proportional-length approximation with REAL
-    per-word timestamps derived from the synthesized audio. Fixes the
-    audio/subtitle drift that came from TTS-baked silent pauses
-    (commas, em-dashes, [pause] tags) and spoken-vs-written token
-    mismatches (e.g. '43%' read as 'forty-three percent').
-    """
-    from reel_af.v2.render.alignment import align_audio
-    from reel_af.v2.render.tts import _strip_tts_tags
-
-    spoken = _strip_tts_tags(narration)
-    word_timings = await align_audio(Path(audio_path), spoken)
-    return {
         "word_timings": [w.model_dump() for w in word_timings],
-        "spoken_narration": spoken,
+        "spoken_narration": strip_tts_tags(narration),
     }
 
 
 @reel.reasoner()
-async def v2_plan_shots(word_timings: list[dict]) -> dict:
-    """V2 Phase 5 — deterministic word_timings → list[Shot].
-
-    Pure code (no LLM). Pack words into cards (5-word / 18-char / clause /
-    gap rules), group cards into shots ≤ 7s so each fits Veo's 8s bucket
-    with safety. Lives in the DAG anyway so failures surface clearly.
-    """
-    from reel_af.v2.models import WordTiming
-    from reel_af.v2.planning.shot_planner import group_into_shots, pack_cards
+async def pack_cards(word_timings: list[dict]) -> dict:
+    """WordTimings → Cards for subtitle layout. Pure code, no LLM."""
+    from reel_af.models import WordTiming
+    from reel_af.planning.cards import pack_cards as _pack
 
     wts = [WordTiming(**w) for w in word_timings]
-    cards = pack_cards(wts)
-    shots = group_into_shots(cards)
-    if not shots:
-        raise RuntimeError(
-            "v2_plan_shots: zero shots from non-empty word_timings — "
-            "check the alignment output."
-        )
-    return {"shots": [s.model_dump() for s in shots]}
+    cards = _pack(wts)
+    return {"cards": [c.model_dump() for c in cards]}
 
 
 @reel.reasoner()
-async def v2_plan_visuals(
-    shots: list[dict], essence: dict, spoken_narration: str,
-) -> dict:
-    """V2 Phase 6a — per-shot image prompt + motion (parallel LLM fan-out)."""
-    from reel_af.v2.agents.visual import plan_visuals
-    from reel_af.v2.models import Essence, Shot
+async def plan_beats(script: dict, audio_duration_s: float) -> dict:
+    """ScriptDraft → Beats. One Beat per (hook | mechanism_line | payoff).
 
-    shot_objs = [Shot(**s) for s in shots]
+    Each beat gets a fixed Veo bucket (4 / 6 / 8 s) chosen by role
+    (hook floors at 6s; payoff caps at 4s for the snappy loop close;
+    mechanism uses the smallest bucket ≥ word-share estimate + safety).
+    """
+    from reel_af.models import ScriptDraft
+    from reel_af.planning.beats import plan_beats as _plan
+
+    s = ScriptDraft(**script)
+    beats = _plan(s, audio_duration_s)
+    if not beats:
+        raise RuntimeError("plan_beats: zero beats from non-empty script.")
+    return {"beats": [b.model_dump() for b in beats]}
+
+
+@reel.reasoner()
+async def plan_visuals(
+    beats: list[dict], essence: dict, spoken_narration: str,
+) -> dict:
+    """Per-beat first-frame image prompt + motion hint (parallel fan-out)."""
+    from reel_af.agents.visual import plan_beat_visuals
+    from reel_af.models import Beat, Essence
+
+    beat_objs = [Beat(**b) for b in beats]
     e = Essence(**essence)
-    visuals = await plan_visuals(
-        app, shot_objs, e, full_narration=spoken_narration,
+    visuals = await plan_beat_visuals(
+        app, beat_objs, e, full_narration=spoken_narration,
     )
     return {"visuals": [v.model_dump() for v in visuals]}
 
 
 @reel.reasoner()
-async def v2_plan_accents(shots: list[dict], essence: dict) -> dict:
-    """V2 Phase 6b — per-shot accent overlay or None (parallel LLM fan-out).
+async def plan_accents(beats: list[dict], essence: dict) -> dict:
+    """Per-beat optional editorial overlay (parallel fan-out, biased to None).
 
-    Heavily biased to None per docs/RESEARCH.md — most shots don't get
-    a Layer 2 overlay, only shots where a number / named entity / jargon
-    translation / reaction beat is genuinely warranted.
+    Six canonical patterns: number, named_entity, jargon_translation,
+    hook_title_card, reaction, list_marker. Most beats return None.
     """
-    from reel_af.v2.agents.accent import plan_accents
-    from reel_af.v2.models import Essence, Shot
+    from reel_af.agents.accent import plan_beat_accents
+    from reel_af.models import Beat, Essence
 
-    shot_objs = [Shot(**s) for s in shots]
+    beat_objs = [Beat(**b) for b in beats]
     e = Essence(**essence)
-    accents = await plan_accents(app, shot_objs, e)
+    accents = await plan_beat_accents(app, beat_objs, e)
     return {
         "accents": [a.model_dump() if a is not None else None for a in accents],
     }
 
 
 @reel.reasoner()
-async def v2_generate_videos(
-    shots: list[dict],
+async def generate_videos(
+    beats: list[dict],
     visuals: list[dict],
     content_mode: str,
     out_dir: str,
 ) -> dict:
-    """V2 Phase 7 — per-shot first-frame + Veo i2v (parallel fan-out).
+    """Per-beat first-frame + Veo i2v (parallel fan-out).
 
-    Two-tier fallback per shot: image gen fails → placeholder + ken-burns;
-    Veo i2v fails → real first-frame + ken-burns. Never single-shot fails
-    the whole reel.
+    Two-tier fallback per beat: image fail → placeholder + ken-burns;
+    Veo fail → real first-frame + ken-burns. A single beat failure
+    never crashes the whole reel.
     """
-    from reel_af.v2.models import Shot, ShotVisual
-    from reel_af.v2.render.video import generate_videos
+    from reel_af.models import Beat, BeatVisual
+    from reel_af.render.video import generate_beat_videos
 
-    shot_objs = [Shot(**s) for s in shots]
-    visual_objs = [ShotVisual(**v) for v in visuals]
+    beat_objs = [Beat(**b) for b in beats]
+    visual_objs = [BeatVisual(**v) for v in visuals]
     media_dir = Path(out_dir) / "media"
-    artifacts = await generate_videos(
-        shots=shot_objs,
+    artifacts = await generate_beat_videos(
+        beats=beat_objs,
         visuals=visual_objs,
         out_dir=media_dir,
         content_mode=content_mode,
@@ -897,36 +332,29 @@ async def v2_generate_videos(
 
 
 @reel.reasoner()
-async def v2_stitch(
-    shots: list[dict],
-    visuals: list[dict],
+async def stitch_reel(
+    beats: list[dict],
     artifacts: list[dict],
+    cards: list[dict],
     accents: list[dict | None],
     audio_path: str,
     out_dir: str,
     run_id: str,
 ) -> dict:
-    """V2 Phase 8 — single-pass ffmpeg: concat filter + libass + audio mux.
+    """Single-pass ffmpeg: concat filter + libass + AAC mux."""
+    from reel_af.models import AccentOverlay, Beat, BeatArtifact, Card
+    from reel_af.render.stitch import stitch_reel as _stitch
 
-    One ffmpeg invocation:
-      [v0][v1]…concat → subtitles=reel.ass → libx264
-      audio=full.wav → aac
-    Sample-accurate by construction. No per-shot AAC priming drift,
-    no concat-demuxer wobble, no per-shot ASS clock translation.
-    """
-    from reel_af.v2.models import AccentOverlay, Shot, ShotArtifact, ShotVisual
-    from reel_af.v2.render.stitch import stitch_v2
-
-    shot_objs = [Shot(**s) for s in shots]
-    visual_objs = [ShotVisual(**v) for v in visuals]
-    artifact_objs = [ShotArtifact(**a) for a in artifacts]
+    beat_objs = [Beat(**b) for b in beats]
+    artifact_objs = [BeatArtifact(**a) for a in artifacts]
+    card_objs = [Card(**c) for c in cards]
     accent_objs = [
         AccentOverlay(**a) if a is not None else None for a in accents
     ]
-    final = await stitch_v2(
-        shots=shot_objs,
-        visuals=visual_objs,
+    final = await _stitch(
+        beats=beat_objs,
         artifacts=artifact_objs,
+        cards=card_objs,
         accents=accent_objs,
         full_audio_path=Path(audio_path),
         out_dir=Path(out_dir),
@@ -935,20 +363,22 @@ async def v2_stitch(
     return {"video_path": str(final)}
 
 
-# ─── Entry orchestrator — composes the phases via app.call so each shows
-#     up as its own node in the control-plane DAG. ──────────────────────
+# ════════════════════════════════════════════════════════════════════
+# ENTRY REASONER 1 — Article → Reel
+# ════════════════════════════════════════════════════════════════════
 
 
 @reel.reasoner()
-async def v2_generate(url: str, out_dir: str | None = None) -> dict:
-    """V2 entry — orchestrates the 8 phase reasoners via app.call.
+async def article_to_reel(
+    url: str, out_dir: str | None = None,
+) -> dict:
+    """Turn an article URL into a vertical viral reel.
 
-    Each app.call goes through the control plane → the workflow DAG is
-    visible in the UI and each phase can be rerun individually for
-    debugging. Mirrors v1's generate() DAG pattern.
+    Composes the DAG via ``app.call`` so every phase is a visible node
+    in the control plane and individually re-runnable.
 
     Example:
-      curl -X POST http://localhost:8080/api/v1/execute/async/reel-af.reel_v2_generate \\
+      curl -X POST http://localhost:8080/api/v1/execute/async/reel-af.reel_article_to_reel \\
         -H 'Content-Type: application/json' \\
         -d '{"input":{"url":"https://example.com/article"}}'
     """
@@ -957,7 +387,7 @@ async def v2_generate(url: str, out_dir: str | None = None) -> dict:
 
     run_id = uuid.uuid4().hex[:8]
     out_path = (
-        Path(out_dir) if out_dir else (Path.cwd() / "output" / f"v2-{run_id}")
+        Path(out_dir) if out_dir else (Path.cwd() / "output" / f"article-{run_id}")
     )
     out_path.mkdir(parents=True, exist_ok=True)
     media_dir = out_path / "media"
@@ -966,139 +396,308 @@ async def v2_generate(url: str, out_dir: str | None = None) -> dict:
     timings: dict[str, float] = {}
     node = app.node_id
     app.note(
-        f"reel-af v2: starting run {run_id} for {url}",
-        tags=["reel", "v2", "start"],
+        f"reel-af article: starting run {run_id} for {url}",
+        tags=["reel", "article", "start"],
     )
     t_pipeline = time.time()
 
-    # ───── Phase 1: extract essence ─────────────────────────────────
+    # Phase 1 — extract
     t = time.time()
-    e_out = await app.call(f"{node}.reel_v2_extract_essence", url=url)
+    e_out = await app.call(f"{node}.reel_extract_essence", url=url)
     timings["extract"] = round(time.time() - t, 1)
     essence = e_out["essence"]
 
-    # ───── Phase 2: compose script ──────────────────────────────────
+    # Phase 2 — compose
     t = time.time()
-    c_out = await app.call(f"{node}.reel_v2_compose_script", essence=essence)
+    c_out = await app.call(f"{node}.reel_compose_script", essence=essence)
     timings["compose"] = round(time.time() - t, 1)
     script = c_out["script"]
 
-    # ───── Phase 3: synthesize audio ────────────────────────────────
+    final = await _render_downstream(
+        node=node,
+        essence=essence,
+        script=script,
+        out_path=out_path,
+        media_dir=media_dir,
+        run_id=run_id,
+        timings=timings,
+    )
+
+    timings["total"] = round(time.time() - t_pipeline, 1)
+    app.note(
+        f"reel-af article: run {run_id} done → {final['video_path']}",
+        tags=["reel", "article", "done"],
+    )
+    return {
+        **final,
+        "source": "article",
+        "url": url,
+        "hook": script["hook"],
+        "hook_variant": script["hook_variant"],
+        "content_mode": essence["content_mode"],
+        "domain": essence["domain"],
+        "run_id": run_id,
+        "timings_s": timings,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════
+# ENTRY REASONER 2 — Topic → Reel
+# ════════════════════════════════════════════════════════════════════
+
+
+@reel.reasoner()
+async def topic_to_reel(
+    topic: str, out_dir: str | None = None,
+) -> dict:
+    """Turn a topic string into a vertical viral reel.
+
+    Internally runs an 8-node hunter cascade (4 parallel hunters →
+    critic → 3 parallel narrators → pairwise judge) to produce a
+    delayed-reveal narration, then the same shared downstream path as
+    article_to_reel.
+
+    Example:
+      curl -X POST http://localhost:8080/api/v1/execute/async/reel-af.reel_topic_to_reel \\
+        -H 'Content-Type: application/json' \\
+        -d '{"input":{"topic":"philosophy of mind"}}'
+    """
+    if "OPENROUTER_API_KEY" not in os.environ:
+        return {"error": "OPENROUTER_API_KEY not set in env."}
+
+    run_id = uuid.uuid4().hex[:8]
+    out_path = (
+        Path(out_dir) if out_dir else (Path.cwd() / "output" / f"topic-{run_id}")
+    )
+    out_path.mkdir(parents=True, exist_ok=True)
+    media_dir = out_path / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+
+    timings: dict[str, float] = {}
+    node = app.node_id
+    app.note(
+        f"reel-af topic: starting run {run_id} for topic={topic!r}",
+        tags=["reel", "topic", "start"],
+    )
+    t_pipeline = time.time()
+
+    # Phase 1 — 4 parallel hunters
+    t = time.time()
+    h_results = await asyncio.gather(
+        app.call(f"{node}.reel_hunt_specific_figure", topic=topic),
+        app.call(f"{node}.reel_hunt_reversal", topic=topic),
+        app.call(f"{node}.reel_hunt_temporal", topic=topic),
+        app.call(f"{node}.reel_hunt_cross_domain", topic=topic),
+    )
+    all_candidates: list[dict] = [
+        c for batch in h_results for c in batch["candidates"]
+    ]
+    timings["hunt"] = round(time.time() - t, 1)
+
+    # Phase 2 — critic picks top 3
+    t = time.time()
+    crit_out = await app.call(
+        f"{node}.reel_pick_top_essences",
+        topic=topic,
+        candidates=all_candidates,
+        n_top=3,
+    )
+    timings["critic"] = round(time.time() - t, 1)
+    chosen_essences: list[dict] = crit_out["chosen_essences"]
+
+    # Phase 3 — 3 narrators in parallel
+    t = time.time()
+    narr_out = await app.call(
+        f"{node}.reel_write_narrations",
+        essences=chosen_essences,
+    )
+    timings["narrate"] = round(time.time() - t, 1)
+    scripts: list[dict] = narr_out["scripts"]
+
+    # Phase 4 — judge picks winner
+    t = time.time()
+    verdict = await app.call(
+        f"{node}.reel_pick_best_narration",
+        topic=topic,
+        scripts=scripts,
+        essences=chosen_essences,
+    )
+    timings["judge"] = round(time.time() - t, 1)
+    winner_idx = max(0, min(verdict["winner_idx"], len(scripts) - 1))
+    winner_script = scripts[winner_idx]
+    winner_essence = chosen_essences[winner_idx]
+
+    # ── Map ConversationalScript → ScriptDraft for the downstream ─────
+    # Beats/visuals/accents all operate on ScriptDraft; the topic
+    # pipeline writes ConversationalScripts so we adapt the field
+    # shapes (tease → hook, reveal-sentences → mechanism_lines, …).
+    reveal_sentences = [
+        s.strip()
+        for s in re.split(r"(?<=[.!?])\s+", winner_script["reveal"].strip())
+        if s.strip()
+    ]
+    if len(reveal_sentences) < 2:
+        # ScriptDraft requires min_length=2 on mechanism_lines.
+        reveal_sentences = (
+            reveal_sentences + [winner_script.get("common_belief") or "."]
+        )[:2]
+
+    essence = {
+        "core_claim": winner_essence["core_claim"],
+        "mechanism": winner_essence["mechanism"],
+        "evidence": winner_essence["evidence"],
+        "content_mode": "general",  # topic-derived → conversational register
+        "domain": winner_essence["domain"],
+    }
+    script = {
+        "hook": winner_script["tease"],
+        "hook_variant": "curiosity_gap",
+        "mechanism_lines": reveal_sentences[:4],
+        "payoff_line": winner_script["payoff"],
+        "target_wpm": 180,
+        "narration": winner_script["narration"],
+    }
+
+    final = await _render_downstream(
+        node=node,
+        essence=essence,
+        script=script,
+        out_path=out_path,
+        media_dir=media_dir,
+        run_id=run_id,
+        timings=timings,
+    )
+
+    timings["total"] = round(time.time() - t_pipeline, 1)
+    app.note(
+        f"reel-af topic: run {run_id} done → {final['video_path']}",
+        tags=["reel", "topic", "done"],
+    )
+    return {
+        **final,
+        "source": "topic",
+        "topic": topic,
+        "tease": winner_script["tease"],
+        "reveal": winner_script["reveal"],
+        "payoff": winner_script["payoff"],
+        "common_belief": winner_script.get("common_belief"),
+        "open_style": winner_script["open_style"],
+        "chosen_essence": winner_essence,
+        "winner_composite": verdict.get("composite_score"),
+        "winner_why": verdict.get("why"),
+        "all_candidates": all_candidates,
+        "all_narrations": [s["narration"] for s in scripts],
+        "run_id": run_id,
+        "timings_s": timings,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════
+# Shared downstream orchestrator
+# ════════════════════════════════════════════════════════════════════
+
+
+async def _render_downstream(
+    *,
+    node: str,
+    essence: dict,
+    script: dict,
+    out_path: Path,
+    media_dir: Path,
+    run_id: str,
+    timings: dict[str, float],
+) -> dict:
+    """audio → cards/beats (parallel) → visuals/accents (parallel) →
+    videos → stitch. Used by both entry points."""
+
+    # TTS — sentence-by-sentence
     t = time.time()
     a_out = await app.call(
-        f"{node}.reel_v2_synthesize_audio",
+        f"{node}.reel_synthesize_audio",
         narration=script["narration"],
-        voice_tone=script.get("voice_tone", "wonder"),
+        voice_tone="wonder",
         out_dir=str(media_dir),
     )
     timings["tts"] = round(time.time() - t, 1)
 
-    # ───── Phase 4: forced alignment ────────────────────────────────
+    # Cards (subtitle layout) ∥ Beats (video planning)
     t = time.time()
-    al_out = await app.call(
-        f"{node}.reel_v2_align_audio",
-        audio_path=a_out["audio_path"],
-        narration=script["narration"],
-    )
-    timings["align"] = round(time.time() - t, 1)
-
-    # ───── Phase 5: plan shots (deterministic) ──────────────────────
-    t = time.time()
-    p_out = await app.call(
-        f"{node}.reel_v2_plan_shots",
-        word_timings=al_out["word_timings"],
-    )
+    cards_task = asyncio.create_task(app.call(
+        f"{node}.reel_pack_cards",
+        word_timings=a_out["word_timings"],
+    ))
+    beats_task = asyncio.create_task(app.call(
+        f"{node}.reel_plan_beats",
+        script=script,
+        audio_duration_s=a_out["duration_s"],
+    ))
+    cards_out, beats_out = await asyncio.gather(cards_task, beats_task)
     timings["plan"] = round(time.time() - t, 1)
-    shots = p_out["shots"]
+    cards = cards_out["cards"]
+    beats = beats_out["beats"]
 
-    # ───── Phase 6: visuals ∥ accents (parallel) ────────────────────
+    # Visuals ∥ Accents
     t = time.time()
-    visuals_task = asyncio.create_task(
-        app.call(
-            f"{node}.reel_v2_plan_visuals",
-            shots=shots,
-            essence=essence,
-            spoken_narration=al_out["spoken_narration"],
-        )
-    )
-    accents_task = asyncio.create_task(
-        app.call(
-            f"{node}.reel_v2_plan_accents",
-            shots=shots,
-            essence=essence,
-        )
-    )
+    visuals_task = asyncio.create_task(app.call(
+        f"{node}.reel_plan_visuals",
+        beats=beats,
+        essence=essence,
+        spoken_narration=a_out["spoken_narration"],
+    ))
+    accents_task = asyncio.create_task(app.call(
+        f"{node}.reel_plan_accents",
+        beats=beats,
+        essence=essence,
+    ))
     v_out, ac_out = await asyncio.gather(visuals_task, accents_task)
     timings["visual_accent"] = round(time.time() - t, 1)
 
-    # ───── Phase 7: generate videos ─────────────────────────────────
+    # Videos
     t = time.time()
     g_out = await app.call(
-        f"{node}.reel_v2_generate_videos",
-        shots=shots,
+        f"{node}.reel_generate_videos",
+        beats=beats,
         visuals=v_out["visuals"],
         content_mode=essence["content_mode"],
         out_dir=str(out_path),
     )
     timings["media"] = round(time.time() - t, 1)
 
-    # ───── Phase 8: stitch ──────────────────────────────────────────
+    # Stitch
     t = time.time()
     s_out = await app.call(
-        f"{node}.reel_v2_stitch",
-        shots=shots,
-        visuals=v_out["visuals"],
+        f"{node}.reel_stitch_reel",
+        beats=beats,
         artifacts=g_out["artifacts"],
+        cards=cards,
         accents=ac_out["accents"],
         audio_path=a_out["audio_path"],
         out_dir=str(out_path),
         run_id=run_id,
     )
     timings["stitch"] = round(time.time() - t, 1)
-    timings["total"] = round(time.time() - t_pipeline, 1)
 
-    app.note(
-        f"reel-af v2: run {run_id} done → {s_out['video_path']}",
-        tags=["reel", "v2", "done"],
-    )
     return {
         "video_path": s_out["video_path"],
         "duration_s": a_out["duration_s"],
-        "script": al_out["spoken_narration"],
-        "hook": script["hook"],
-        "hook_variant": script["hook_variant"],
-        "content_mode": essence["content_mode"],
-        "target_wpm": script["target_wpm"],
-        "domain": essence["domain"],
-        "shot_count": len(shots),
-        "card_count": sum(len(s["cards"]) for s in shots),
+        "narration": a_out["spoken_narration"],
+        "voice_id": a_out["voice"],
+        "beat_count": len(beats),
+        "card_count": len(cards),
         "accent_count": sum(1 for a in ac_out["accents"] if a is not None),
-        "run_id": run_id,
-        "timings_s": timings,
-        "algo": "v2",
     }
 
 
-# Back-compat alias: keep the prior endpoint name working.
-@reel.reasoner()
-async def generate_v2(url: str, out_dir: str | None = None) -> dict:
-    """Deprecated alias for v2_generate. Forwards to the DAG entry point.
-
-    Kept so existing curl invocations targeting reel-af.reel_generate_v2
-    don't break — but the DAG-visible version is reel_v2_generate.
-    """
-    node = app.node_id
-    return await app.call(
-        f"{node}.reel_v2_generate", url=url, out_dir=out_dir,
-    )
+# ════════════════════════════════════════════════════════════════════
+# Server
+# ════════════════════════════════════════════════════════════════════
 
 
 app.include_router(reel)
 
 
-# Health endpoint so `af server` discovery + docker healthchecks work.
 def _health() -> dict:
-    return {"status": "ok", "service": "reel-af", "version": "0.1.0"}
+    return {"status": "ok", "service": "reel-af", "version": "1.0.0"}
 
 
 from typing import cast as _cast  # noqa: E402

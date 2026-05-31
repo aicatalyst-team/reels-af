@@ -4,8 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reel-af"
-version = "0.1.0"
-description = "URL → vertical reel: multi-agent pipeline for viral short-form video"
+version = "1.0.0"
+description = "URL or topic → vertical viral reel via a multi-reasoner DAG on AgentField."
+license = { text = "Apache-2.0" }
+authors = [{ name = "AgentField Contributors" }]
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "agentfield",
@@ -28,7 +31,7 @@ dev = [
 ]
 
 [project.scripts]
-reel-af = "reel_af.cli:app"
+reel-af = "reel_af.cli:main"
 reel-af-server = "reel_af.app:main"
 
 [tool.setuptools.packages.find]

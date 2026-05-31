@@ -27,7 +27,7 @@ async def _kick(session, label, url):
     out = f"output/scientific/{label}"
     Path(out).mkdir(parents=True, exist_ok=True)
     async with session.post(
-        f"{CONTROL_PLANE}/api/v1/execute/async/reel-af.reel_generate",
+        f"{CONTROL_PLANE}/api/v1/execute/async/reel-af.reel_article_to_reel",
         json={"input": {"url": url, "out_dir": out}},
     ) as resp:
         data = json.loads(await resp.text() or "{}")

@@ -29,7 +29,7 @@ Article URL or topic phrase → 1080×1920 vertical reel with word-burst karaoke
 
 ## One-Call DX
 
-Trigger it with the `af` CLI (requires af ≥ 0.1.86) — it streams live progress and prints the result:
+Trigger it with the `af` CLI (requires af ≥ 0.1.87) — it streams live progress and prints the result:
 
 ```bash
 # URL → reel

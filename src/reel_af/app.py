@@ -66,8 +66,15 @@ app = Agent(
     description="URL or topic → vertical viral reel via a multi-reasoner DAG.",
     ai_config=AIConfig(
         model=os.getenv("REEL_AF_MODEL", "openrouter/deepseek/deepseek-v4-pro"),
-        api_key=os.environ.get("OPENROUTER_API_KEY", ""),
-        api_base="https://openrouter.ai/api/v1",
+        # Reasoning endpoint defaults to OpenRouter. Advanced users can point
+        # `.ai()` calls at any OpenAI-compatible endpoint (local vLLM/Ollama,
+        # a self-hosted gateway, another aggregator) without code changes:
+        #   REEL_AF_API_KEY  overrides the key (falls back to OPENROUTER_API_KEY)
+        #   REEL_AF_API_BASE overrides the base URL (empty/unset → OpenRouter)
+        # Media (TTS/image/video) still routes through OpenRouter, so
+        # OPENROUTER_API_KEY remains required. See README "Bring your own model".
+        api_key=os.getenv("REEL_AF_API_KEY") or os.environ.get("OPENROUTER_API_KEY", ""),
+        api_base=os.getenv("REEL_AF_API_BASE") or "https://openrouter.ai/api/v1",
     ),
     dev_mode=True,
 )

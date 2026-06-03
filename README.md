@@ -260,6 +260,32 @@ Voice, pacing, and tone are picked in code (`render/tts.py:_VOICE_BY_TONE` and t
 
 ---
 
+## Bring your own model (advanced)
+
+OpenRouter is the recommended path — one key, every model, zero config. But if you'd rather run **reasoning** against your own OpenAI-compatible endpoint — a local [vLLM](https://github.com/vllm-project/vllm) / [Ollama](https://ollama.com/) server, a self-hosted gateway, or a different aggregator — you can, without touching code:
+
+```bash
+REEL_AF_MODEL=openai/your-model-id          # how your endpoint names the model
+REEL_AF_API_BASE=http://localhost:8000/v1   # your OpenAI-compatible base URL
+REEL_AF_API_KEY=sk-local-or-anything        # your endpoint's key
+```
+
+Leave `REEL_AF_API_BASE` / `REEL_AF_API_KEY` unset and everything points at OpenRouter exactly as before — this is strictly additive, the default flow is unchanged.
+
+| Env var | Default | What it controls |
+|---|---|---|
+| `REEL_AF_API_BASE` | OpenRouter (`https://openrouter.ai/api/v1`) | Base URL for reasoning `.ai()` calls. Empty = OpenRouter. |
+| `REEL_AF_API_KEY` | falls back to `OPENROUTER_API_KEY` | Key sent to the reasoning endpoint. |
+
+Two caveats:
+
+- **Media still uses OpenRouter.** TTS, image, and Veo generation route through OpenRouter today, so keep `OPENROUTER_API_KEY` set even when reasoning is self-hosted. Configurable per-provider media endpoints are tracked in [issue #2](https://github.com/Agent-Field/reels-af/issues/2).
+- **Use the `openai/` prefix** for OpenAI-compatible servers so the request is shaped correctly; `REEL_AF_API_BASE` then redirects it to your host.
+
+This intentionally isn't the headline workflow — it adds moving parts. For most users, the one-key OpenRouter default is the simpler path.
+
+---
+
 ## Troubleshooting
 
 **"OPENROUTER_API_KEY not set in env."** — paste your key into `.env`. The Docker container reads it via `docker-compose.yml`; the CLI reads it via `python-dotenv`.

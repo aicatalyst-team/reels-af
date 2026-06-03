@@ -23,6 +23,10 @@ services:
       AGENT_NODE_ID: ${AGENT_NODE_ID:-reel-af}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       REEL_AF_MODEL: ${REEL_AF_MODEL:-openrouter/deepseek/deepseek-v4-pro}
+      # Advanced: point reasoning at any OpenAI-compatible endpoint. Empty
+      # values are treated as unset and fall back to OpenRouter.
+      REEL_AF_API_BASE: ${REEL_AF_API_BASE:-}
+      REEL_AF_API_KEY: ${REEL_AF_API_KEY:-}
       REEL_AF_TTS_MODEL: ${REEL_AF_TTS_MODEL:-google/gemini-3.1-flash-tts-preview}
       REEL_AF_IMAGE_MODEL: ${REEL_AF_IMAGE_MODEL:-openrouter/google/gemini-2.5-flash-image}
       REEL_AF_VIDEO_MODEL: ${REEL_AF_VIDEO_MODEL:-openrouter/google/veo-3.1-lite}

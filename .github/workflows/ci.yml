@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ffmpeg/ffprobe are a hard runtime requirement (karaoke render path);
+      # the render tests exercise the real binaries.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Pin Python (matches the Dockerfile)
+        run: uv python install 3.11
+
+      # Lint the test suite. NOTE: src/ carries some pre-existing ruff debt
+      # tracked separately; scope here is the code this CI guards.
+      - name: Lint tests
+        run: uv run --extra dev ruff check tests/
+
+      - name: Run tests
+        run: uv run --extra dev python -m pytest tests/ -q

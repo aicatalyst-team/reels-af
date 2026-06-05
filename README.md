@@ -204,16 +204,18 @@ docker compose up --build
 
 Open **http://localhost:8080/ui/** to watch the 18-reasoner DAG execute live. Fire either of the curls from [One-Call DX](#one-call-dx) above — outputs land under `./output/<run-id>/reel.mp4` with a `result.json` sidecar.
 
-Without Docker — local CLI:
+CLI wrapper against the running stack:
 
 ```bash
 uv sync
-brew install ffmpeg            # macOS  (apt install ffmpeg fonts-montserrat on Linux)
 cp .env.example .env
 
 reel-af article "https://arxiv.org/abs/2509.25541"
 reel-af topic   "the placebo effect"
 ```
+
+The CLI submits to the AgentField control plane at `http://localhost:8080`
+by default. Use `--server` if your control plane is exposed elsewhere.
 
 Swap any model or flip on Veo motion with one env var:
 

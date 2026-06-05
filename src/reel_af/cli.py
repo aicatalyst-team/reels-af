@@ -5,9 +5,9 @@ Two subcommands mirror the two entry reasoners:
   reel-af article URL                # article_to_reel
   reel-af topic "topic phrase"       # topic_to_reel
 
-The CLI runs the orchestrator function directly (no AgentField server
-required). For production use with the control-plane DAG, run
-``python -m reel_af.app`` and POST to the ``/execute/async/...`` API.
+The CLI submits async executions to the AgentField control plane and
+polls until the run finishes. Start the stack with ``docker compose up
+--build`` or run ``af server`` + ``reel-af serve`` before invoking it.
 """
 
 from __future__ import annotations
@@ -16,10 +16,11 @@ import asyncio
 import json
 import os
 import sys
-import uuid
+import time
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
+import aiohttp
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
@@ -36,11 +37,129 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console(stderr=True)
+DEFAULT_AGENTFIELD_SERVER = os.getenv("AGENTFIELD_SERVER", "http://localhost:8080")
+DEFAULT_TIMEOUT_S = 1800
+DEFAULT_POLL_INTERVAL_S = 5.0
 
 
 def _require_key() -> None:
     if "OPENROUTER_API_KEY" not in os.environ:
         raise SystemExit("OPENROUTER_API_KEY not set (put it in .env)")
+
+
+def _server_url(server: str) -> str:
+    return server.rstrip("/")
+
+
+def _decode_json(body: str) -> dict[str, Any]:
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"AgentField response was not JSON: {body[:500]}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"AgentField response was not an object: {data!r}")
+    return data
+
+
+async def _execute_reasoner(
+    *,
+    server: str,
+    target: str,
+    input_payload: dict[str, Any],
+    timeout_s: int,
+    poll_interval_s: float,
+) -> tuple[str, dict[str, Any]]:
+    base = _server_url(server)
+    execute_url = f"{base}/api/v1/execute/async/{target}"
+    timeout = aiohttp.ClientTimeout(total=None)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.post(
+                execute_url,
+                json={"input": input_payload},
+            ) as resp:
+                body = await resp.text()
+        except aiohttp.ClientError as exc:
+            raise SystemExit(
+                f"Cannot reach AgentField at {base}. Start it with "
+                "`docker compose up --build` or pass --server."
+            ) from exc
+
+        if resp.status >= 400:
+            raise SystemExit(
+                f"AgentField rejected {target} ({resp.status}): {body[:800]}"
+            )
+
+        started = _decode_json(body)
+        exec_id = started.get("execution_id") or started.get("id")
+        if not exec_id:
+            raise SystemExit(f"AgentField did not return execution_id: {started}")
+
+        console.print(f"[dim]execution_id: {exec_id}[/dim]")
+        start = time.monotonic()
+        last_status: str | None = None
+
+        while True:
+            elapsed = int(time.monotonic() - start)
+            if elapsed > timeout_s:
+                raise SystemExit(
+                    f"Timed out after {timeout_s}s waiting for {exec_id}."
+                )
+
+            try:
+                async with session.get(f"{base}/api/v1/executions/{exec_id}") as resp:
+                    body = await resp.text()
+            except aiohttp.ClientError as exc:
+                console.print(f"[yellow]poll error:[/yellow] {exc}")
+                await asyncio.sleep(poll_interval_s)
+                continue
+
+            if resp.status >= 400:
+                raise SystemExit(
+                    f"AgentField poll failed for {exec_id} ({resp.status}): "
+                    f"{body[:800]}"
+                )
+
+            state = _decode_json(body)
+            status = str(state.get("status") or "?")
+            if status != last_status or elapsed % 60 == 0:
+                console.print(f"[dim][{elapsed:4d}s] status={status}[/dim]")
+                last_status = status
+
+            if status == "succeeded":
+                result = state.get("result")
+                if not isinstance(result, dict):
+                    raise SystemExit(
+                        f"Execution {exec_id} succeeded without a JSON result: {state}"
+                    )
+                return str(exec_id), result
+
+            if status in {"failed", "cancelled", "canceled"}:
+                raise SystemExit(
+                    f"Execution {exec_id} {status}:\n"
+                    f"{json.dumps(state, indent=2, default=str)[:4000]}"
+                )
+
+            await asyncio.sleep(poll_interval_s)
+
+
+def _sidecar_dir(result: dict[str, Any], explicit_out_dir: Path | None) -> Path:
+    if explicit_out_dir is not None:
+        return explicit_out_dir
+
+    video_path = result.get("video_path")
+    if isinstance(video_path, str) and video_path:
+        path = Path(video_path)
+        if path.is_absolute():
+            parts = path.parts
+            if "output" in parts:
+                output_idx = parts.index("output")
+                return Path.cwd().joinpath(*parts[output_idx:]).parent
+        return (Path.cwd() / path).parent
+
+    run_id = str(result.get("run_id") or "unknown")
+    return Path.cwd() / "output" / run_id
 
 
 def _summarize(result: dict, run_id: str, out_path: Path) -> None:
@@ -77,25 +196,52 @@ def article(
     url: Annotated[str, typer.Argument(help="The article URL.")],
     out_dir: Annotated[
         Optional[Path],
-        typer.Option("--out", help="Output directory.", show_default=False),
+        typer.Option(
+            "--out",
+            help="Output directory as seen by the running agent.",
+            show_default=False,
+        ),
     ] = None,
+    server: Annotated[
+        str,
+        typer.Option("--server", help="AgentField control-plane URL."),
+    ] = DEFAULT_AGENTFIELD_SERVER,
+    timeout_s: Annotated[
+        int,
+        typer.Option("--timeout", help="Maximum seconds to wait."),
+    ] = DEFAULT_TIMEOUT_S,
+    poll_interval_s: Annotated[
+        float,
+        typer.Option("--poll-interval", help="Seconds between status polls."),
+    ] = DEFAULT_POLL_INTERVAL_S,
 ) -> None:
     """Turn an article URL into a vertical viral reel."""
-    _require_key()
-    from reel_af.app import article_to_reel
+    input_payload: dict[str, Any] = {"url": url}
+    if out_dir is not None:
+        input_payload["out_dir"] = str(out_dir)
 
-    run_id = uuid.uuid4().hex[:8]
-    out_path = out_dir or (Path.cwd() / "output" / f"article-{run_id}")
-    out_path.mkdir(parents=True, exist_ok=True)
-
-    console.rule(f"[bold]article_to_reel — {run_id}")
+    console.rule("[bold]article_to_reel")
     console.print(f"  url: [cyan]{url}[/cyan]")
-    console.print(f"  out: [dim]{out_path}[/dim]\n")
+    console.print(f"  server: [dim]{_server_url(server)}[/dim]")
+    if out_dir is not None:
+        console.print(f"  out: [dim]{out_dir}[/dim]")
+    console.print()
 
-    result = asyncio.run(article_to_reel(url=url, out_dir=str(out_path)))
+    exec_id, result = asyncio.run(
+        _execute_reasoner(
+            server=server,
+            target="reel-af.reel_article_to_reel",
+            input_payload=input_payload,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+    )
     if "error" in result:
         console.print(f"[red]error:[/red] {result['error']}")
         sys.exit(1)
+    run_id = str(result.get("run_id") or exec_id[:8])
+    out_path = _sidecar_dir(result, out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
     _summarize(result, run_id, out_path)
 
 
@@ -104,25 +250,52 @@ def topic(
     topic: Annotated[str, typer.Argument(help="The topic phrase.")],
     out_dir: Annotated[
         Optional[Path],
-        typer.Option("--out", help="Output directory.", show_default=False),
+        typer.Option(
+            "--out",
+            help="Output directory as seen by the running agent.",
+            show_default=False,
+        ),
     ] = None,
+    server: Annotated[
+        str,
+        typer.Option("--server", help="AgentField control-plane URL."),
+    ] = DEFAULT_AGENTFIELD_SERVER,
+    timeout_s: Annotated[
+        int,
+        typer.Option("--timeout", help="Maximum seconds to wait."),
+    ] = DEFAULT_TIMEOUT_S,
+    poll_interval_s: Annotated[
+        float,
+        typer.Option("--poll-interval", help="Seconds between status polls."),
+    ] = DEFAULT_POLL_INTERVAL_S,
 ) -> None:
     """Turn a topic into a vertical viral reel (multi-reasoner cascade)."""
-    _require_key()
-    from reel_af.app import topic_to_reel
+    input_payload: dict[str, Any] = {"topic": topic}
+    if out_dir is not None:
+        input_payload["out_dir"] = str(out_dir)
 
-    run_id = uuid.uuid4().hex[:8]
-    out_path = out_dir or (Path.cwd() / "output" / f"topic-{run_id}")
-    out_path.mkdir(parents=True, exist_ok=True)
-
-    console.rule(f"[bold]topic_to_reel — {run_id}")
+    console.rule("[bold]topic_to_reel")
     console.print(f"  topic: [cyan]{topic}[/cyan]")
-    console.print(f"  out:   [dim]{out_path}[/dim]\n")
+    console.print(f"  server: [dim]{_server_url(server)}[/dim]")
+    if out_dir is not None:
+        console.print(f"  out:   [dim]{out_dir}[/dim]")
+    console.print()
 
-    result = asyncio.run(topic_to_reel(topic=topic, out_dir=str(out_path)))
+    exec_id, result = asyncio.run(
+        _execute_reasoner(
+            server=server,
+            target="reel-af.reel_topic_to_reel",
+            input_payload=input_payload,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+    )
     if "error" in result:
         console.print(f"[red]error:[/red] {result['error']}")
         sys.exit(1)
+    run_id = str(result.get("run_id") or exec_id[:8])
+    out_path = _sidecar_dir(result, out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
     _summarize(result, run_id, out_path)
 
 

@@ -8,12 +8,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Install system dependencies: ffmpeg and fonts
 USER 0
-RUN dnf install -y \
-        https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm && \
-    dnf install -y --enablerepo=epel \
-        ffmpeg-free \
-        dejavu-sans-fonts && \
-    dnf clean all
+RUN dnf install -y dejavu-sans-fonts && \
+    dnf clean all && \
+    curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | \
+    tar xJ --strip-components=1 -C /usr/local/bin/ --wildcards '*/ffmpeg' '*/ffprobe'
 
 USER 1001
 

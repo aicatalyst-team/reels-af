@@ -1,0 +1,40 @@
+FROM registry.access.redhat.com/ubi9/python-312
+
+WORKDIR /opt/app-root/src
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/opt/app-root/src/src
+
+# Install system dependencies: ffmpeg and fonts
+USER 0
+RUN dnf install -y \
+        https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm && \
+    dnf install -y --enablerepo=epel \
+        ffmpeg-free \
+        dejavu-sans-fonts \
+        google-noto-sans-fonts && \
+    dnf clean all
+
+USER 1001
+
+# Copy dependency file first for layer caching
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir .
+
+# Copy rest of the project
+COPY . .
+
+# OpenShift compatibility: group 0 permissions
+USER 0
+RUN mkdir -p /opt/app-root/src/output && \
+    chgrp -R 0 /opt/app-root && chmod -R g=u /opt/app-root
+USER 1001
+
+EXPOSE 8002
+
+CMD ["python", "main.py"]
